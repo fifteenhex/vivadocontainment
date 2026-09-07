@@ -70,10 +70,29 @@ LICENSE_SPEC     = $(if $(XILINXD_LICENSE_FILE),$(XILINXD_LICENSE_FILE),$(if $(L
 MAC             ?=
 GUEST_MAC        = $(if $(MAC),$(MAC),$(shell cat $(BUILD)/mac 2>/dev/null))
 
-# Empty this to give the guest the run of the network again. On, nothing
-# reaches the guest but the forwarded ssh port and the guest reaches nothing
-# at all. qemu enforces it, so a job that somehow got root in the guest still
-# could not talk to your LAN.
+# --------------------------------------------------------------- mqtt job ---
+
+# Where agents queue jobs. Empty disables the job runner entirely (ssh still
+# works). See README for the message format.
+MQTT_BROKER     ?=
+MQTT_PORT       ?= 1883
+MQTT_TOPIC      ?= vivado
+MQTT_USER       ?=
+MQTT_PASS       ?=
+# Identifies this worker in topics and its client id; several VMs can share
+# a broker as long as this differs.
+MQTT_WORKER     ?= vivado1
+# Where projects live in the guest. Keep this on the scratch disk (make
+# scratch) or they die with the VM, since everything else is a tmpfs overlay.
+MQTT_ROOT       ?= /scratch/projects
+# The guest reaches the broker at this address whatever its real one is; qemu
+# maps it. Fixed, so changing brokers is a restart rather than an image
+# rebuild.
+GUEST_BROKER    ?= 10.0.2.100
+# Empty this to give the guest the run of the network again. On, it can reach
+# exactly one thing -- the broker, on one port -- and nothing can reach it but
+# the forwarded ssh port. qemu enforces it, so a job that somehow got root in
+# the guest still could not talk to your LAN.
 NET_RESTRICT    ?= 1
 
 # ------------------------------------------------------------ guest build ---
@@ -95,7 +114,8 @@ PACKAGES        ?= linux-image-$(ARCH) initramfs-tools systemd-sysv udev \
                    libxtst6 libxi6 libxft2 libfontconfig1 libfreetype6 \
                    libglib2.0-0 libsm6 libice6 libstdc++6 zlib1g \
                    libpixman-1-0 \
-                   fontconfig fonts-dejavu-core locales
+                   fontconfig fonts-dejavu-core locales \
+                   python3-paho-mqtt
 EXTRA_PACKAGES  ?=
 
 # ---------------------------------------------------------------- images ---
@@ -165,7 +185,7 @@ space := $(subst ,, )
 SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=virtio$(comma)format=qcow2)
 # restrict=on drops everything not named here; hostfwd is the way in and
 # guestfwd the way out, and both are explicit rules that survive it.
-NET_ARGS = $(if $(NET_RESTRICT),$(comma)restrict=on)$(comma)hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22
+NET_ARGS = $(if $(NET_RESTRICT),$(comma)restrict=on)$(comma)hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22$(if $(MQTT_BROKER),$(comma)guestfwd=tcp:$(GUEST_BROKER):$(MQTT_PORT)-tcp:$(MQTT_BROKER):$(MQTT_PORT))
 MAC_ARG     = $(if $(GUEST_MAC),$(comma)mac=$(GUEST_MAC))
 
 QEMU_ARGS = \
@@ -181,7 +201,7 @@ QEMU_ARGS = \
 
 # ----------------------------------------------------------------- rules ---
 
-.PHONY: all rootfs vivado run run-bg stop ssh license-mac sizes deps \
+.PHONY: all rootfs vivado run run-bg stop ssh vc watch license-mac sizes deps \
         scratch check clean clean-all info
 
 all: rootfs vivado
@@ -216,6 +236,19 @@ $(GUEST): $(GUEST_SRC) Makefile $(wildcard config.mk) $(LICENSE_FILE) | $(BUILD)
 	cp -a guest $@.tmp
 	sed -i 's|@VIVADO_MNT@|$(VIVADO_MNT)|g; s|@LICENSE@|$(LICENSE_SPEC)|g' \
 		$@.tmp/etc/fstab $@.tmp/etc/profile.d/vivado.sh
+	@# the guest always dials the mapped address; qemu decides where it lands
+	sed -i -e 's|@BROKER@|$(GUEST_BROKER)|' -e 's|@PORT@|$(MQTT_PORT)|' \
+		-e 's|@TOPIC@|$(MQTT_TOPIC)|' -e 's|@WORKER@|$(MQTT_WORKER)|' \
+		-e 's|@ROOT@|$(MQTT_ROOT)|' \
+		$@.tmp/etc/vivadocontainment/mqtt.conf
+	@# credentials are appended with printf, not sed: a password containing
+	@# & or | would otherwise be mangled into something that silently fails
+	sed -i -e '/^USER=@USER@$$/d' -e '/^PASS=@PASS@$$/d' \
+		$@.tmp/etc/vivadocontainment/mqtt.conf
+	printf 'USER=%s\nPASS=%s\n' '$(MQTT_USER)' '$(MQTT_PASS)' \
+		>> $@.tmp/etc/vivadocontainment/mqtt.conf
+	@# it holds broker credentials and every job user can read the image
+	chmod 600 $@.tmp/etc/vivadocontainment/mqtt.conf
 	@test -n "$(SSH_PUBKEY)" || { echo "SSH_PUBKEY is empty and no key found in ~/.ssh"; exit 1; }
 	@test -r "$(SSH_PUBKEY)" || { echo "cannot read SSH_PUBKEY=$(SSH_PUBKEY)"; exit 1; }
 	mkdir -p $@.tmp/root/.ssh
@@ -244,9 +277,11 @@ INCLUDE := $(subst $(space),$(comma),$(strip $(PACKAGES) $(EXTRA_PACKAGES)))
 # Stamps that change only when a value the step actually uses changes. Without
 # them every edit to config.mk -- including one that only affects the Vivado
 # image -- would rerun mmdebstrap, which is minutes and a network round trip.
-GUEST_VARS  = $(VIVADO_MNT) $(LICENSE_SPEC) $(SSH_PUBKEY)
+GUEST_VARS  = $(VIVADO_MNT) $(LICENSE_SPEC) $(GUEST_BROKER) $(MQTT_PORT) \
+              $(MQTT_TOPIC) $(MQTT_USER) $(MQTT_PASS) $(MQTT_WORKER) \
+              $(MQTT_ROOT) $(SSH_PUBKEY)
 ROOTFS_VARS = $(SUITE) $(MIRROR) $(COMPONENTS) $(ARCH) $(INCLUDE) \
-              $(VIVADO_MNT)
+              $(VIVADO_MNT) $(MQTT_BROKER)
 
 .PHONY: FORCE
 FORCE:
@@ -274,7 +309,7 @@ $(ROOTFS_TAR): $(GUEST_SRC) $(BUILD)/guest.vars $(BUILD)/rootfs.vars \
 		--customize-hook='sync-in $(GUEST) /' \
 		--customize-hook='chroot "$$1" mkdir -p "$(VIVADO_MNT)" /scratch' \
 		--customize-hook='chroot "$$1" /usr/local/sbin/vc-fixups' \
-		--customize-hook='chroot "$$1" systemctl enable ssh systemd-networkd vc-scratch.service' \
+		--customize-hook='chroot "$$1" systemctl enable ssh systemd-networkd vc-scratch.service $(if $(MQTT_BROKER),vc-projd.service)' \
 		--customize-hook='chroot "$$1" update-initramfs -u -k all' \
 		$(SUITE) $@ $(MIRROR)
 
@@ -327,6 +362,28 @@ SSH_OPTS = -p $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
            -o LogLevel=ERROR
 ssh:
 	ssh $(SSH_OPTS) root@$(SSH_HOST)
+
+# Everything the agents do, from the host:
+#   make vc ARGS="-p demo create"
+#   make vc ARGS="-p demo put build.tcl"
+#   make vc ARGS="-p demo vivado build.tcl"
+vc:
+	@test -n "$(ARGS)" || { echo 'usage: make vc ARGS="-p PROJECT op ..."'; exit 1; }
+	scripts/vc --broker $(if $(MQTT_BROKER),$(MQTT_BROKER),localhost) \
+		--port $(MQTT_PORT) --topic $(MQTT_TOPIC) \
+		$(if $(MQTT_USER),--user $(MQTT_USER) --password $(MQTT_PASS)) $(ARGS)
+
+# Watch what the agents and the worker are saying:
+#   make watch                  -- everything on the base topic
+#   make watch PROJECT=demo     -- just one project
+# MQTT_PASS lands in the process list; put "-P secret" in
+# ~/.config/mosquitto_sub instead if that matters here.
+WATCH_TOPIC = $(MQTT_TOPIC)/$(if $(PROJECT),project/$(PROJECT)/,)\#
+watch:
+	@command -v mosquitto_sub >/dev/null || { echo "need mosquitto-clients"; exit 1; }
+	mosquitto_sub -h $(if $(MQTT_BROKER),$(MQTT_BROKER),localhost) -p $(MQTT_PORT) \
+		$(if $(MQTT_USER),-u $(MQTT_USER) -P $(MQTT_PASS)) \
+		-F '%I %t %p' -t '$(WATCH_TOPIC)'
 
 license-mac:
 	@echo "license  $(if $(LICENSE_FILE),$(LICENSE_FILE),<none found>)"

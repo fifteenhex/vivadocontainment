@@ -1,0 +1,298 @@
+#!/usr/bin/python3
+"""Talk to a vivadocontainment worker over MQTT.
+
+    vc --broker bighost -p demo create
+    vc -p demo put top.v src/top.v
+    vc -p demo put build.tcl
+    vc -p demo vivado build.tcl --log out/vivado.log -- -core_div 40 -pcie
+    vc -p demo jobs
+    vc -p demo ls -r
+    vc -p demo get build/top.bit top.bit
+    vc -p demo destroy
+
+Everything goes over one topic per project; there is no shared filesystem.
+This is a thin client -- read it as the reference for what an agent should
+publish. Exit code is the job's exit code for run, 1 for a failed request.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+
+import paho.mqtt.client as mqtt
+
+CHUNK = 192 * 1024      # base64 inflates by 4/3, keeps payloads under ~256k
+
+
+def make_client(client_id):
+    try:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+    except AttributeError:
+        return mqtt.Client(client_id=client_id)
+
+
+def positional(args, *flags):
+    """Everything after the op is REMAINDER, so pick our own flags back out."""
+    found = [a for a in args.args if a in flags]
+    return [a for a in args.args if a not in flags and a != "--"], bool(found)
+
+
+class Session:
+    def __init__(self, args):
+        self.args = args
+        self.base = args.topic.rstrip("/")
+        self.project = args.project
+        self.replies = []
+        self.done = False
+        self.job = None
+        self.boot = None
+        self.client = make_client(f"vc-{os.getpid()}")
+        if args.user:
+            self.client.username_pw_set(args.user, args.password)
+        self.client.on_message = self._on_message
+        self.client.connect(args.broker, args.port, keepalive=30)
+        self.client.loop_start()
+
+    def topic(self, suffix):
+        return f"{self.base}/project/{self.project}/{suffix}"
+
+    def note_boot(self, reply):
+        """A changed boot id means the worker went away between requests,
+        which is the one thing a client must not miss."""
+        boot = reply.get("boot")
+        if boot and self.boot and boot != self.boot:
+            print(f"vc: worker rebooted (boot {self.boot[:8]} -> {boot[:8]}); "
+                  "running jobs are dead, check jobs and ls", file=sys.stderr)
+        if boot:
+            self.boot = boot
+
+    def _on_message(self, client, userdata, msg):
+        if msg.topic.endswith("/log"):
+            if not self.args.quiet:
+                print(msg.payload.decode(errors="replace"), flush=True)
+            return
+        if "/reply/" not in msg.topic:
+            # Brokers hand out retained messages liberally on subscribe, and
+            # worker/<w>/state is a bare "online". Never crash on traffic we
+            # did not ask for.
+            return
+        try:
+            reply = json.loads(msg.payload)
+        except ValueError:
+            print(f"vc: ignoring non-JSON reply on {msg.topic}", file=sys.stderr)
+            return
+        self.note_boot(reply)
+        self.replies.append(reply)
+        if reply.get("final"):
+            self.done = True
+
+    def request(self, op, wait=True, **body):
+        """Publish one request and collect replies until the final one."""
+        req = f"c{int(time.time() * 1000)}-{len(self.replies)}"
+        self.replies, self.done = [], False
+        self.client.subscribe(self.topic(f"reply/{req}"), qos=1)
+        if op in ("vivado", "tool"):
+            self.client.subscribe(self.topic("job/+/log"), qos=0)
+        self.client.publish(self.topic("request"),
+                            json.dumps(dict(body, req=req, op=op)), qos=1)
+        if not wait:
+            return []
+        deadline = time.time() + self.args.wait if self.args.wait else None
+        while not self.done:
+            if deadline and time.time() > deadline:
+                raise SystemExit("vc: timed out waiting for a reply")
+            time.sleep(0.05)
+        self.client.unsubscribe(self.topic(f"reply/{req}"))
+        for reply in self.replies:
+            if not reply.get("ok", True):
+                raise SystemExit(f"vc: {reply.get('error', 'failed')}")
+        return self.replies
+
+    def close(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+
+def do_put(s, args):
+    rest, _ = positional(args)
+    if not rest:
+        raise SystemExit("vc: put needs a local file")
+    local = rest[0]
+    remote = rest[1] if len(rest) > 1 else os.path.basename(local)
+    data = open(local, "rb").read()
+    mode = oct(os.stat(local).st_mode & 0o777)[2:]
+    if len(data) <= CHUNK:
+        s.request("put", path=remote, mode=mode,
+                  b64=base64.b64encode(data).decode())
+    else:
+        count = (len(data) + CHUNK - 1) // CHUNK
+        cid = f"{os.path.basename(local)}-{int(time.time())}"
+        for index in range(count):
+            part = data[index * CHUNK:(index + 1) * CHUNK]
+            s.request("put", path=remote, mode=mode,
+                      b64=base64.b64encode(part).decode(),
+                      chunk={"id": cid, "index": index, "count": count})
+    print(f"{local} -> {s.project}:{remote} ({len(data)} bytes)")
+    return 0
+
+
+def do_get(s, args):
+    rest, _ = positional(args)
+    if not rest:
+        raise SystemExit("vc: get needs a remote path")
+    remote = rest[0]
+    local = rest[1] if len(rest) > 1 else os.path.basename(remote)
+    replies = [r for r in s.request("get", path=remote) if "b64" in r]
+    # arrival order is not chunk order
+    replies.sort(key=lambda r: r.get("chunk", {}).get("index", 0))
+    data = b"".join(base64.b64decode(r["b64"]) for r in replies)
+    expected = replies[-1].get("size") if replies else 0
+    if expected is not None and len(data) != expected:
+        raise SystemExit(f"vc: short transfer, got {len(data)} of {expected} bytes")
+    if local == "-":
+        sys.stdout.buffer.write(data)
+    else:
+        with open(local, "wb") as f:
+            f.write(data)
+        print(f"{s.project}:{remote} -> {local} ({len(data)} bytes)")
+    return 0
+
+
+def do_ls(s, args):
+    rest, recursive = positional(args, "-r", "--recursive")
+    path = rest[0] if rest else ""
+    recursive = recursive or args.recursive
+    for entry in s.request("ls", path=path, recursive=recursive)[-1]["entries"]:
+        kind = "d" if entry["dir"] else "-"
+        print(f"{kind} {entry['size']:>12}  {entry['path']}")
+    return 0
+
+
+def split_job_flags(args):
+    """argparse stops at the op, so flags written after it -- the natural
+    "vivado build.tcl --log out/x.log -- -core_div 40" -- arrive as words.
+    Everything after -- belongs to the tool, not to us."""
+    rest = list(args.args)
+    trailing = []
+    if "--" in rest:
+        cut = rest.index("--")
+        rest, trailing = rest[:cut], rest[cut + 1:]
+    opts = {"cwd": args.cwd, "timeout": args.timeout, "log": None,
+            "journal": False}
+    words = []
+    while rest:
+        flag = rest.pop(0)
+        if flag in ("--cwd", "--timeout", "--log", "--journal") and rest:
+            value = rest.pop(0)
+            opts[flag[2:]] = float(value) if flag == "--timeout" else value
+        elif flag == "--nojournal":
+            opts["journal"] = False
+        elif flag in ("-q", "--quiet"):
+            args.quiet = True
+        else:
+            words.append(flag)
+    return opts, words, trailing
+
+
+def report_job(result):
+    if result.get("error"):
+        print(f"vc: {result['error']}", file=sys.stderr)
+    print(f"vc: job {result.get('job')} rc={result.get('rc')} "
+          f"in {result.get('seconds')}s", file=sys.stderr)
+    rc = int(result.get("rc", 1))
+    return rc if rc >= 0 else 128 - rc          # killed by signal, shell style
+
+
+def do_vivado(s, args):
+    opts, words, tclargs = split_job_flags(args)
+    if not words:
+        raise SystemExit("vc: vivado needs a tcl file")
+    if opts["timeout"] is None:
+        print("vc: no --timeout, this job can hold the worker for ever",
+              file=sys.stderr)
+    return report_job(s.request(
+        "vivado", tcl=words[0], tclargs=tclargs, log=opts["log"],
+        journal=opts["journal"], cwd=opts["cwd"], timeout=opts["timeout"])[-1])
+
+
+def do_tool(s, args):
+    opts, words, trailing = split_job_flags(args)
+    if not words:
+        raise SystemExit("vc: tool needs a tool name (xvlog, xelab, xsim)")
+    return report_job(s.request(
+        "tool", tool=words[0], args=words[1:] + trailing, cwd=opts["cwd"],
+        timeout=opts["timeout"])[-1])
+
+
+def do_jobs(s, args):
+    rest, _ = positional(args)
+    for job in s.request("jobs", job=rest[0] if rest else None)[-1]["jobs"]:
+        state = job.get("state")
+        rc = job.get("rc")
+        print(f"{job['id']}  {state:<8} rc={rc if rc is not None else '-':<4} "
+              f"{job.get('seconds', '-')}s  {' '.join(job.get('cmd', []))}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--broker", default=os.environ.get("VC_BROKER", "localhost"))
+    p.add_argument("--port", type=int,
+                   default=int(os.environ.get("VC_PORT", 1883)))
+    p.add_argument("--topic", default=os.environ.get("VC_TOPIC", "vivado"))
+    p.add_argument("-p", "--project", default=os.environ.get("VC_PROJECT"),
+                   required="VC_PROJECT" not in os.environ)
+    p.add_argument("--user", default=os.environ.get("VC_USER"))
+    p.add_argument("--password", default=os.environ.get("VC_PASS"))
+    p.add_argument("--cwd", default="", help="working directory for run")
+    p.add_argument("--timeout", type=float, help="job timeout in seconds")
+    p.add_argument("--wait", type=float, default=0,
+                   help="give up on a reply after this many seconds")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="do not stream job output")
+    p.add_argument("op", choices=["create", "destroy", "put", "get", "rm",
+                                  "ls", "vivado", "tool", "version", "jobs",
+                                  "cancel", "status"])
+    p.add_argument("args", nargs=argparse.REMAINDER)
+    args = p.parse_args()
+
+    s = Session(args)
+    try:
+        if args.op == "put":
+            return do_put(s, args)
+        if args.op == "get":
+            return do_get(s, args)
+        if args.op == "ls":
+            return do_ls(s, args)
+        if args.op == "vivado":
+            return do_vivado(s, args)
+        if args.op == "tool":
+            return do_tool(s, args)
+        if args.op == "jobs":
+            return do_jobs(s, args)
+        if args.op == "cancel":
+            rest, _ = positional(args)
+            if not rest:
+                raise SystemExit("vc: cancel needs a job id")
+            s.request("cancel", job=rest[0])
+            return 0
+        if args.op == "rm":
+            rest, recursive = positional(args, "-r", "--recursive")
+            if not rest:
+                raise SystemExit("vc: rm needs a path")
+            s.request("rm", path=rest[0], recursive=recursive or args.recursive)
+            return 0
+        reply = s.request(args.op)[-1]
+        print(json.dumps({k: v for k, v in reply.items()
+                          if k not in ("req", "final", "op")}, indent=2))
+        return 0
+    finally:
+        s.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

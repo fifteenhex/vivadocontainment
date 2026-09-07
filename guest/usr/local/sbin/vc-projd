@@ -1,0 +1,865 @@
+#!/usr/bin/python3
+"""Projects and Vivado jobs over MQTT, and nothing but MQTT.
+
+There is deliberately no way to run a command of the caller's choosing: the
+ops below build the argv themselves from validated fields, so an agent can
+drive Vivado without being able to reach a shell.
+
+Everything an agent needs happens on one topic per project:
+
+    <base>/project/<name>/request        requests in
+    <base>/project/<name>/reply/<reqid>  replies out
+    <base>/project/<name>/job/<id>/log   job output, line by line
+
+A request is JSON: {"req": "<id>", "op": "<op>", ...}. Every reply carries the
+same "req" and a "final" flag, so a client publishes, subscribes to its own
+reply topic and waits for final. See README.md for the full protocol.
+"""
+
+import base64
+import binascii
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+import paho.mqtt.client as mqtt
+
+CONF = "/etc/vivadocontainment/mqtt.conf"
+VC_EXEC = "/usr/local/bin/vc-exec"
+# The only binaries an agent can ask for. Everything else -- shells, argv of
+# its own choosing, an environment to poison -- is deliberately unreachable.
+TOOLS = {"xvlog", "xelab", "xsim"}
+# A chunked upload cannot be more parts than this; a count of a million is a
+# typo, and it stages a partial that could never complete.
+MAX_CHUNKS = 10000
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# A req id becomes a topic level. A slash would silently move the reply to a
+# topic the caller is not subscribed to, and +/# would make it a wildcard.
+REQ_RE = re.compile(r"^[^/+#\s]{1,128}$")
+# Fields that used to exist and would now be quietly ignored, which is worse
+# than refusing them: a caller would think its environment was applied.
+REFUSED = {"cmd": "run was replaced by the vivado and tool ops",
+           "env": "the worker builds the environment; it cannot be set"}
+
+
+def log(msg):
+    print(f"vc-projd: {msg}", flush=True)
+
+
+def make_client(client_id):
+    """paho-mqtt 2.x wants a callback API version, 1.x has never heard of it."""
+    try:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id,
+                           clean_session=True)
+    except AttributeError:
+        return mqtt.Client(client_id=client_id, clean_session=True)
+
+
+def load_conf(path):
+    conf = {}
+    if not os.path.exists(path):
+        return conf
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip()
+    return conf
+
+
+class FairQueue:
+    """Round-robin over projects, FIFO within one.
+
+    One worker, several agents: a project that queues ten builds must not
+    push a neighbour's single build to the back of all ten. The project is
+    the only identity the protocol has, so it is the unit of fairness.
+    """
+
+    def __init__(self):
+        self.wake = threading.Condition()
+        self.queues = {}            # project -> list of jobs, oldest first
+        self.order = []             # rotation, least recently served last
+        self.closed = False
+
+    def put(self, job):
+        with self.wake:
+            project = job["project"]
+            self.queues.setdefault(project, []).append(job)
+            if project not in self.order:
+                # Next, not last: a project already in the rotation has just
+                # had a turn, and a newcomer waiting behind its backlog is
+                # the case this exists to prevent.
+                self.order.insert(0, project)
+            self.wake.notify()
+
+    def get(self):
+        """Block until there is work, then take from the project whose turn
+        it is. Returns None once closed."""
+        with self.wake:
+            while not self.closed and not any(self.queues.values()):
+                self.wake.wait()
+            if self.closed:
+                return None
+            for _ in range(len(self.order)):
+                project = self.order.pop(0)
+                self.order.append(project)
+                jobs = self.queues.get(project)
+                if jobs:
+                    return jobs.pop(0)
+            return None
+
+    def snapshot(self):
+        with self.wake:
+            return [job for project in self.order
+                    for job in self.queues.get(project, [])]
+
+    def close(self):
+        with self.wake:
+            self.closed = True
+            self.wake.notify_all()
+
+
+class Error(Exception):
+    """Anything the client did wrong, reported back as ok=false."""
+
+
+def as_str(value, field):
+    """Type checks belong at the top of a handler. Letting the first
+    operation that touches a field decide its type turns a client mistake
+    into a stack trace."""
+    if not isinstance(value, str):
+        raise Error(f"{field} must be a string, got {type(value).__name__}")
+    return value
+
+
+def as_int(value, field):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Error(f"{field} must be an integer, got {type(value).__name__}")
+    return value
+
+
+class Service:
+    def __init__(self, conf):
+        self.conf = conf
+        self.boot = self.boot_id()
+        self.worker = conf.get("WORKER") or "vivado1"
+        self.base = (conf.get("TOPIC") or "vivado").rstrip("/")
+        self.root = conf.get("ROOT") or "/scratch/projects"
+        self.chunk = int(conf.get("MAX_CHUNK") or 262144)
+        self.me = f"{self.base}/worker/{self.worker}"
+        self.jobs = FairQueue()
+        self.current = None
+        self.current_project = None
+        self.proc = None
+        self.current_started = None
+        self.current_op = None
+        # Ids cancelled before they started: the worker drops them when it
+        # reaches them, since a queue cannot be reached into.
+        self.cancelled = set()
+        # current/current_project/proc are touched by both the network thread
+        # (cancel, status) and the job thread.
+        self.lock = threading.Lock()
+        self.client = make_client(f"vc-projd-{self.worker}")
+        if conf.get("USER"):
+            self.client.username_pw_set(conf["USER"], conf.get("PASS") or None)
+        self.client.will_set(f"{self.me}/state", "offline", qos=1, retain=True)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+
+    # -- paths -----------------------------------------------------------
+
+    def project_dir(self, project):
+        if not NAME_RE.match(project):
+            raise Error(f"bad project name {project!r}")
+        return os.path.join(self.root, project)
+
+    def writable(self, project, path):
+        """.vc is the daemon's: job records and logs live there, and a
+        client that can write them can forge its own results. Reading it
+        stays allowed."""
+        full = self.resolve(project, path)
+        base = os.path.realpath(self.project_dir(project))
+        vc = os.path.join(base, ".vc")
+        if full == vc or full.startswith(vc + os.sep):
+            raise Error(f"path {path!r} is inside .vc, which is read-only")
+        return full
+
+    def resolve(self, project, path, must_exist=False):
+        """A path inside the project, with no way out of it."""
+        if isinstance(path, str) and path.startswith("/"):
+            # Silently reinterpreting this as project-relative would have the
+            # reply confirm a path we did not write.
+            raise Error(f"path {path!r} must be relative to the project root")
+        base = os.path.realpath(self.project_dir(project))
+        full = os.path.realpath(os.path.join(base, path or ""))
+        if full != base and not full.startswith(base + os.sep):
+            raise Error(f"path {path!r} escapes the project")
+        if must_exist and not os.path.exists(full):
+            raise Error(f"no such path: {path}")
+        return full
+
+    def boot_id(self):
+        """Changes when the machine reboots and not when the daemon
+        restarts, which is the distinction a client cares about: a restart
+        loses running jobs, a reboot can lose everything not on the disk."""
+        try:
+            with open("/proc/sys/kernel/random/boot_id") as f:
+                return f.read().strip()
+        except OSError:
+            return f"unknown-{os.getpid()}"
+
+    def persistent(self):
+        """True when projects live on their own filesystem rather than on the
+        tmpfs overlay, i.e. when they outlive a reboot."""
+        try:
+            return os.stat(self.root).st_dev != os.stat("/").st_dev
+        except OSError:
+            return False
+
+    def make_parent(self, project, path):
+        """Vivado opens -log before the tcl runs, so the script cannot create
+        the directory itself; mkdir -p is what every wrapper did first."""
+        full = self.resolve(project, path)
+        parent = os.path.dirname(full)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return full
+
+    def projects(self):
+        try:
+            return sorted(d for d in os.listdir(self.root)
+                          if not d.startswith(".")
+                          and os.path.isdir(os.path.join(self.root, d)))
+        except OSError:
+            return []
+
+    # -- mqtt ------------------------------------------------------------
+
+    def on_connect(self, client, userdata, flags, rc, properties=None):
+        if getattr(rc, "value", rc) != 0:
+            log(f"connect failed, rc={rc}")
+            return
+        client.subscribe(f"{self.base}/project/+/request", qos=1)
+        self.publish(f"{self.me}/state", "online", retain=True)
+        self.publish_status()
+        log(f"connected, listening on {self.base}/project/+/request")
+
+    def on_message(self, client, userdata, msg):
+        if msg.retain:
+            # A retained request would be replayed at every reconnect.
+            log(f"ignoring retained message on {msg.topic}")
+            return
+        parts = msg.topic.split("/")
+        project = parts[-2]
+        req, op = None, None
+        try:
+            body = json.loads(msg.payload or b"{}")
+        except ValueError as e:
+            log(f"dropping unparseable request on {msg.topic}: {e}")
+            return
+        if not isinstance(body, dict):
+            log(f"dropping non-object request on {msg.topic}")
+            return
+        try:
+            req = body.get("req")
+            if not isinstance(req, str) or not REQ_RE.match(req):
+                # Cannot answer on a topic built from this, so say so here.
+                log(f"dropping request with unusable req {req!r} on "
+                    f"{msg.topic}: it names the reply topic")
+                return
+            if body.get("worker") not in (None, self.worker):
+                return          # addressed to a different worker on this broker
+            op = body.get("op")
+            for field, why in REFUSED.items():
+                if field in body:
+                    raise Error(f"{field} is not accepted: {why}")
+            handler = getattr(self, f"op_{op}", None) if op else None
+            if handler is None:
+                raise Error(f"unknown op {op!r}")
+            handler(project, req, body)
+        except Error as e:
+            self.reply(project, req, {"op": op, "ok": False, "error": str(e)})
+        except Exception as e:                          # never kill the loop
+            log(f"{project}/{op}: {e}")
+            self.reply(project, req, {"op": op, "ok": False,
+                                      "error": f"{type(e).__name__}: {e}"})
+
+    def publish(self, topic, payload, retain=False, qos=1):
+        if not isinstance(payload, (str, bytes)):
+            payload = json.dumps(payload)
+        self.client.publish(topic, payload, qos=qos, retain=retain)
+
+    def reply(self, project, req, body, final=True):
+        body = dict(body, req=req, final=final, worker=self.worker,
+                    boot=self.boot)
+        body.setdefault("ok", True)
+        self.publish(f"{self.base}/project/{project}/reply/{req}", body)
+
+    def pending(self):
+        """Queued jobs that have not been cancelled out from under us."""
+        with self.lock:
+            cancelled = set(self.cancelled)
+        return sum(1 for j in self.jobs.snapshot() if j["id"] not in cancelled)
+
+    def current_info(self):
+        """Attributed, and with a start time. A bare job id sent one agent
+        looking for the owner and it cancelled a stranger's synthesis."""
+        with self.lock:
+            if not self.current:
+                return None
+            return {"job": self.current, "project": self.current_project,
+                    "op": self.current_op, "started": self.current_started}
+
+    def publish_status(self):
+        self.publish(f"{self.me}/status", {
+            "worker": self.worker,
+            "boot": self.boot,
+            "persistent": self.persistent(),
+            "busy": self.current is not None,
+            "current": self.current_info(),
+            "queued": self.pending(),
+            "root": self.root,
+            "projects": self.projects(),
+            "free": shutil.disk_usage(self.root).free if os.path.isdir(self.root) else 0,
+        }, retain=True)
+
+    # -- project ops -----------------------------------------------------
+
+    def op_create(self, project, req, body):
+        path = self.project_dir(project)
+        existed = os.path.isdir(path)
+        os.makedirs(os.path.join(path, ".vc", "jobs"), exist_ok=True)
+        home = os.path.join(path, ".vc", "home")
+        os.makedirs(home, exist_ok=True)
+        self.publish_status()
+        self.reply(project, req, {"op": "create", "path": path,
+                                  "existed": existed})
+
+    def op_destroy(self, project, req, body):
+        with self.lock:
+            busy = self.current_project == project
+        if busy:
+            raise Error("a job is running in this project; cancel it first")
+        # Queued work for this project is part of "everything in it";
+        # refusing here left projects wedged behind a queue that could not be
+        # emptied.
+        pending = [j for j in self.jobs.snapshot() if j["project"] == project]
+        if pending:
+            self.drop_queued(project, pending)
+        path = self.project_dir(project)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+        self.publish_status()
+        self.reply(project, req, {"op": "destroy", "path": path})
+
+    def op_put(self, project, req, body):
+        path = as_str(body.get("path") or "", "path")
+        if not path:
+            raise Error("put needs a path")
+        full = self.writable(project, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+
+        if "b64" in body:
+            try:
+                data = base64.b64decode(as_str(body["b64"], "b64"), validate=True)
+            except binascii.Error as e:
+                raise Error(f"b64 is not valid base64: {e}")
+        elif "text" in body:
+            data = as_str(body["text"], "text").encode()
+        else:
+            raise Error("put needs b64 or text")
+
+        chunk = body.get("chunk")
+        if chunk:
+            # Parts are staged on disk so order of arrival does not matter.
+            if not isinstance(chunk, dict):
+                raise Error("chunk must be an object")
+            cid = str(chunk.get("id") or req)
+            if not NAME_RE.match(cid):
+                raise Error(f"bad chunk id {cid!r}")
+            try:
+                index = as_int(chunk["index"], "chunk.index")
+                count = as_int(chunk["count"], "chunk.count")
+            except KeyError:
+                raise Error("chunk needs an index and a count")
+            if not 1 <= count <= MAX_CHUNKS:
+                raise Error(f"chunk count must be 1..{MAX_CHUNKS}")
+            if not 0 <= index < count:
+                raise Error(f"chunk index {index} outside 0..{count - 1}")
+            stage = self.resolve(project, os.path.join(".vc", "incoming", cid))
+            os.makedirs(stage, exist_ok=True)
+            # A changed count means two uploads are sharing an id; neither
+            # would ever assemble, and the client would wait forever.
+            marker = os.path.join(stage, "count")
+            if os.path.exists(marker):
+                with open(marker) as f:
+                    if f.read().strip() != str(count):
+                        raise Error(f"chunk id {cid} already in progress with "
+                                    f"a different count")
+            else:
+                with open(marker, "w") as f:
+                    f.write(str(count))
+            with open(os.path.join(stage, f"{index:06d}"), "wb") as f:
+                f.write(data)
+            have = len(os.listdir(stage)) - 1        # minus the count marker
+            if have < count:
+                self.reply(project, req, {"op": "put", "path": path,
+                                          "received": have, "of": count,
+                                          "complete": False})
+                return
+            def parts():
+                for part in sorted(p for p in os.listdir(stage) if p != "count"):
+                    with open(os.path.join(stage, part), "rb") as f:
+                        yield f.read()
+            self.write_file(full, parts())
+            shutil.rmtree(stage)
+        else:
+            self.write_file(full, [data])
+
+        if body.get("mode"):
+            os.chmod(full, int(str(body["mode"]), 8))
+        base = os.path.realpath(self.project_dir(project))
+        self.reply(project, req, {"op": "put", "path": os.path.relpath(full, base),
+                                  "size": os.path.getsize(full),
+                                  "complete": True})
+
+    def op_get(self, project, req, body):
+        full = self.resolve(project, as_str(body.get("path") or "", "path"),
+                            must_exist=True)
+        if os.path.isdir(full):
+            raise Error("get on a directory, use ls")
+        size = os.path.getsize(full)
+        count = max(1, (size + self.chunk - 1) // self.chunk)
+        with open(full, "rb") as f:
+            for index in range(count):
+                data = f.read(self.chunk)
+                self.reply(project, req, {
+                    "op": "get", "path": body.get("path"), "size": size,
+                    "b64": base64.b64encode(data).decode(),
+                    "chunk": {"index": index, "count": count},
+                }, final=(index == count - 1))
+
+    def op_rm(self, project, req, body):
+        full = self.writable(project, as_str(body.get("path") or "", "path"))
+        if not os.path.exists(full):
+            raise Error(f"no such path: {body.get('path')}")
+        if full == os.path.realpath(self.project_dir(project)):
+            raise Error("rm of the project root, use destroy")
+        if os.path.isdir(full):
+            if not body.get("recursive"):
+                raise Error("path is a directory, pass recursive")
+            shutil.rmtree(full)
+        else:
+            os.unlink(full)
+        self.reply(project, req, {"op": "rm", "path": body.get("path")})
+
+    def op_ls(self, project, req, body):
+        base = os.path.realpath(self.project_dir(project))
+        start = self.resolve(project, as_str(body.get("path") or "", "path"),
+                             must_exist=True)
+        entries = []
+
+        def add(p):
+            st = os.lstat(p)          # a broken symlink must not break ls
+            entries.append({"path": os.path.relpath(p, base),
+                            "size": st.st_size, "mtime": int(st.st_mtime),
+                            "dir": os.path.isdir(p)})
+
+        if os.path.isdir(start):
+            if body.get("recursive"):
+                for dirpath, dirnames, filenames in os.walk(start):
+                    dirnames[:] = [d for d in dirnames if d != ".vc"]
+                    for n in sorted(dirnames) + sorted(filenames):
+                        add(os.path.join(dirpath, n))
+            else:
+                for n in sorted(os.listdir(start)):
+                    if n != ".vc":
+                        add(os.path.join(start, n))
+        else:
+            add(start)
+        self.reply(project, req, {"op": "ls", "entries": entries})
+
+    def op_status(self, project, req, body):
+        path = self.project_dir(project)
+        self.publish_status()
+        self.reply(project, req, {
+            "op": "status", "exists": os.path.isdir(path), "path": path,
+            "busy": self.current is not None, "current": self.current_info(),
+            "queued": self.pending(), "projects": self.projects(),
+            "queued_here": sum(1 for j in self.jobs.snapshot()
+                               if j["project"] == project),
+        })
+
+    # -- jobs ------------------------------------------------------------
+
+    def check_job_id(self, job_id):
+        """A job id names a topic and two files, like every other
+        identifier here, so it gets the same treatment."""
+        if job_id is None:
+            return f"j{int(time.time() * 1000)}"
+        if not isinstance(job_id, str) or not NAME_RE.match(job_id):
+            raise Error(f"bad job id {job_id!r}")
+        return job_id
+
+    def check_args(self, args, what):
+        """Arguments are handed to execve as-is; only scalars make sense."""
+        out = []
+        for arg in args or []:
+            if isinstance(arg, bool) or not isinstance(arg, (str, int, float)):
+                raise Error(f"{what} must be a list of strings, got {arg!r}")
+            out.append(str(arg))
+        return out
+
+    def queue_job(self, project, req, argv, body, op):
+        if not os.path.isdir(self.project_dir(project)):
+            raise Error(f"project {project} does not exist, create it first")
+        job = {
+            "project": project,
+            "req": req,
+            "op": op,
+            "queued": int(time.time()),
+            "id": self.check_job_id(body.get("job")),
+            "cmd": argv,
+            "cwd": as_str(body.get("cwd") or "", "cwd"),
+            "timeout": body.get("timeout"),
+        }
+        self.write_record(project, job["id"], {
+            "id": job["id"], "op": op, "cmd": argv, "state": "queued",
+            "cwd": job["cwd"], "queued": int(time.time()),
+        })
+        # Announce before queueing: the worker thread is free to pick this up
+        # the instant it lands, and "running" overtaking "queued" confuses any
+        # client that trusts the last message it saw.
+        self.reply(project, req, {
+            "op": op, "job": job["id"], "state": "queued",
+            "log": f"{self.base}/project/{project}/job/{job['id']}/log",
+        }, final=False)
+        self.jobs.put(job)
+        self.publish_status()
+
+    def op_vivado(self, project, req, body):
+        """vivado -mode batch [-log P] [-nojournal|-journal P] -source TCL
+        [-tclargs ...] -- the only shape either real build script uses."""
+        tcl = as_str(body.get("tcl") or "", "tcl")
+        if not tcl:
+            raise Error("vivado needs a tcl path")
+        argv = ["vivado", "-mode", "batch",
+                "-source", self.resolve(project, tcl, must_exist=True)]
+        if body.get("log"):
+            argv += ["-log", self.make_parent(project, as_str(body["log"], "log"))]
+        journal = body.get("journal", False)
+        if journal is False or journal is None:
+            argv += ["-nojournal"]
+        elif journal is not True:
+            argv += ["-journal",
+                     self.make_parent(project, as_str(journal, "journal"))]
+        tclargs = self.check_args(body.get("tclargs"), "tclargs")
+        if tclargs:
+            argv += ["-tclargs"] + tclargs
+        self.queue_job(project, req, argv, body, "vivado")
+
+    def op_tool(self, project, req, body):
+        """The simulation tools, which take flags but never a shell."""
+        tool = body.get("tool")
+        if not isinstance(tool, str) or tool not in TOOLS:
+            raise Error(f"tool must be one of {sorted(TOOLS)}, got {tool!r}")
+        argv = [tool] + self.check_args(body.get("args"), "args")
+        self.queue_job(project, req, argv, body, "tool")
+
+    def op_version(self, project, req, body):
+        """Fixed argv, no input at all: what is installed in here?
+
+        Note that vivado -version exits before some of the startup a real
+        run does, so rc 0 here does not promise a working build. A caller
+        wanting "is this worker usable" should require both rc 0 and a
+        version string.
+        """
+        try:
+            out = subprocess.run([VC_EXEC, "vivado", "-version"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise Error(f"cannot run vivado: {e}")
+
+        stdout = out.stdout.decode(errors="replace").strip()
+        stderr = out.stderr.decode(errors="replace").strip()
+        # Warnings from settings64.sh and friends are not a version string,
+        # so look for the real line rather than taking whatever came first.
+        version = None
+        for line in stdout.splitlines():
+            # 2026.1 prints "vivado v2026.1 (64-bit)", older ones capitalise
+            # the tool name; match either.
+            if "vivado v" in line.lower():
+                version = line.strip()
+                break
+        self.reply(project, req, {"op": "version", "rc": out.returncode,
+                                  "version": version, "output": stdout,
+                                  "stderr": stderr})
+
+    def op_jobs(self, project, req, body):
+        """Every job this project has run, so a result outlives the client."""
+        jobdir = self.resolve(project, os.path.join(".vc", "jobs"))
+        wanted = body.get("job")
+        records = []
+        for name in sorted(os.listdir(jobdir)) if os.path.isdir(jobdir) else []:
+            if not name.endswith(".json"):
+                continue
+            if wanted and name != f"{wanted}.json":
+                continue
+            try:
+                with open(os.path.join(jobdir, name)) as f:
+                    records.append(json.load(f))
+            except (OSError, ValueError):
+                continue
+        records.sort(key=lambda r: r.get("queued", 0), reverse=True)
+        self.reply(project, req, {"op": "jobs", "jobs": records})
+
+    def stop_proc(self, sig=signal.SIGTERM):
+        """Signal the whole process group. Build tcl uses exec, so killing
+        just vivado leaves its children holding the pipe open and the job
+        slot with it."""
+        with self.lock:
+            proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except OSError:
+            try:
+                proc.send_signal(sig)
+            except OSError:
+                return False
+        return True
+
+    def drop_queued(self, project, jobs):
+        """Take jobs out of the queue by marking them; the worker skips them
+        when it gets there. Their own requests get a final reply, or a client
+        waiting on one would wait for ever."""
+        with self.lock:
+            self.cancelled.update(j["id"] for j in jobs)
+        for job in jobs:
+            self.write_record(project, job["id"], {
+                "id": job["id"], "op": job["op"], "cmd": job["cmd"],
+                "state": "cancelled", "cwd": job["cwd"], "boot": self.boot,
+                "queued": job.get("queued"), "rc": -1,
+                "error": "cancelled before it started"})
+            self.reply(project, job["req"],
+                       {"op": job["op"], "job": job["id"], "state": "cancelled",
+                        "rc": -1, "error": "cancelled before it started"})
+
+    def op_cancel(self, project, req, body):
+        target = body.get("job")
+        with self.lock:
+            running = (self.current == target
+                       and self.current_project == project)
+        if running and self.stop_proc():
+            self.reply(project, req, {"op": "cancel", "job": target,
+                                      "cancelled": True, "state": "running"})
+            return
+        queued = [j for j in self.jobs.snapshot()
+                  if j["id"] == target and j["project"] == project]
+        if queued:
+            self.drop_queued(project, queued)
+            self.publish_status()
+            self.reply(project, req, {"op": "cancel", "job": target,
+                                      "cancelled": True, "state": "queued"})
+            return
+        self.reply(project, req, {"op": "cancel", "job": target,
+                                  "ok": False, "cancelled": False,
+                                  "error": "no such job running or queued "
+                                           "in this project"})
+
+    def write_file(self, full, chunks):
+        """Write through a temp file and rename.
+
+        Atomicity is the smaller reason. The larger one is that Debian sets
+        fs.protected_regular=2, and a project directory is sticky and
+        group-writable, so the kernel refuses even root's O_CREAT of an
+        existing file owned by the project user -- which is every file we
+        hand over. A rename is not subject to that check.
+        """
+        tmp = full + ".vc-part"
+        with open(tmp, "wb") as f:
+            for block in chunks:
+                f.write(block)
+        os.replace(tmp, full)
+
+    def write_record(self, project, job_id, record):
+        """The durable half of a job result. Clients disconnect; builds do
+        not stop, and the log alone never says whether the build passed."""
+        path = self.resolve(project, os.path.join(".vc", "jobs",
+                                                  job_id + ".json"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f, indent=1)
+        os.replace(tmp, path)          # readers must never see a half record
+
+    def run_job(self, job):
+        project, job_id, req = job["project"], job["id"], job["req"]
+        logtopic = f"{self.base}/project/{project}/job/{job_id}/log"
+        workdir = self.resolve(project, job["cwd"])
+        os.makedirs(workdir, exist_ok=True)
+        logpath = self.resolve(project, os.path.join(".vc", "jobs",
+                                                     job_id + ".log"))
+        os.makedirs(os.path.dirname(logpath), exist_ok=True)
+
+        # No caller-supplied environment: LD_PRELOAD alone would undo the
+        # point of taking arbitrary commands away.
+        env = dict(os.environ)
+
+        with self.lock:
+            self.current, self.current_project = job_id, project
+            self.current_started, self.current_op = int(time.time()), job["op"]
+        self.publish_status()
+        self.reply(project, req, {"op": job["op"], "job": job_id,
+                                  "state": "running", "log": logtopic},
+                   final=False)
+        started = time.time()
+        record = {"id": job_id, "op": job["op"], "cmd": job["cmd"],
+                  "state": "running", "cwd": job["cwd"], "boot": self.boot,
+                  "queued": job.get("queued", int(started)),
+                  "started": int(started),
+                  "log": os.path.join(".vc", "jobs", job_id + ".log")}
+        self.write_record(project, job_id, record)
+        log(f"{project}/{job_id}: {' '.join(job['cmd'])}")
+
+        tail, rc, error = [], -1, None
+        try:
+            with open(logpath, "wb") as logfile:
+                # vc-exec sources settings64.sh before exec'ing the command.
+                proc = subprocess.Popen(
+                    [VC_EXEC] + job["cmd"], cwd=workdir,
+                    env=env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+                with self.lock:
+                    self.proc = proc
+                # A silent Vivado run still has to hit its timeout, so kill it
+                # from a timer rather than from the output loop.
+                timer = None
+                if job["timeout"]:
+                    timer = threading.Timer(float(job["timeout"]),
+                                            self.stop_proc)
+                    timer.start()
+                for raw in proc.stdout:
+                    logfile.write(raw)
+                    logfile.flush()
+                    line = raw.decode(errors="replace").rstrip("\n")
+                    tail.append(line)
+                    del tail[:-200]
+                    self.publish(logtopic, line, qos=0)
+                rc = proc.wait()
+                if timer:
+                    if not timer.is_alive():
+                        error = "timeout"
+                    timer.cancel()
+        except OSError as e:
+            error = str(e)
+        finally:
+            # Whatever went wrong up there, the build must not outlive the
+            # job: an abandoned Vivado holds the licence and the job slot.
+            if self.stop_proc(signal.SIGKILL):
+                log(f"{project}/{job_id}: killed an abandoned process group")
+            if self.proc is not None:
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    log(f"{project}/{job_id}: process group would not die")
+            with self.lock:
+                self.proc = None
+
+        # ok means the request was carried out; whether the build passed is
+        # rc's business, so a failing Vivado run is not a protocol error.
+        result = {
+            "op": job["op"], "job": job_id, "state": "done",
+            "rc": rc, "seconds": round(time.time() - started, 1),
+            "log": os.path.join(".vc", "jobs", job_id + ".log"),
+            "tail": tail[-50:],
+        }
+        if error:
+            result["error"] = error
+        record.update({k: v for k, v in result.items() if k != "tail"})
+        record["ended"] = int(time.time())
+        self.write_record(project, job_id, record)
+        self.reply(project, req, result)
+        log(f"{project}/{job_id}: rc={rc} in {result['seconds']}s")
+        with self.lock:
+            self.current, self.current_project = None, None
+        self.publish_status()
+
+    # -- main loop -------------------------------------------------------
+
+    def reconcile(self):
+        """Restart=always means a crash mid-build leaves a record claiming
+        to be running for ever, which a client cannot tell from a slow
+        synthesis."""
+        for project in self.projects():
+            jobdir = os.path.join(self.root, project, ".vc", "jobs")
+            for name in sorted(os.listdir(jobdir)) if os.path.isdir(jobdir) else []:
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(jobdir, name)
+                try:
+                    with open(path) as f:
+                        record = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                if record.get("state") in ("running", "queued"):
+                    record["state"] = "interrupted"
+                    record["error"] = "the worker restarted while this ran"
+                    record.setdefault("rc", -1)
+                    self.write_record(project, record["id"], record)
+                    log(f"{project}/{record['id']}: marked interrupted")
+
+    def loop(self):
+        host = self.conf.get("BROKER")
+        if not host:
+            log("no BROKER configured, nothing to do")
+            return 0
+        os.makedirs(self.root, exist_ok=True)
+        self.reconcile()
+        if not os.path.ismount("/scratch") and self.root.startswith("/scratch"):
+            log("warning: /scratch is not mounted, projects live in RAM and "
+                "die with the VM (make scratch)")
+        self.client.connect_async(host, int(self.conf.get("PORT") or 1883),
+                                  keepalive=30)
+        self.client.loop_start()
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                break
+            with self.lock:
+                skipped = job["id"] in self.cancelled
+                self.cancelled.discard(job["id"])
+            if skipped:
+                log(f"{job['project']}/{job['id']}: cancelled before it ran")
+                self.publish_status()
+                continue
+            try:
+                self.run_job(job)
+            except Exception as e:
+                log(f"job failed: {e}")
+                self.reply(job["project"], job["req"],
+                           {"op": job["op"], "job": job["id"], "ok": False,
+                            "error": str(e)})
+                self.current = None
+                self.publish_status()
+        return 0
+
+
+def main():
+    service = Service(load_conf(CONF))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    return service.loop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

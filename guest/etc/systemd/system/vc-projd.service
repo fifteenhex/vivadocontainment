@@ -1,0 +1,17 @@
+[Unit]
+Description=Vivado project and job service (MQTT)
+After=network-online.target vc-scratch.service
+Wants=network-online.target
+Requires=vc-scratch.service
+
+[Service]
+ExecStart=/usr/local/sbin/vc-projd
+Restart=always
+RestartSec=5
+# Vivado wants a real home and plenty of file descriptors.
+Environment=HOME=/root
+Environment=LANG=en_US.UTF-8
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

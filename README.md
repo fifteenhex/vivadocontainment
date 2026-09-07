@@ -1,8 +1,10 @@
 # vivadocontainment
 
 Takes an existing Vivado installation and puts it inside an immutable QEMU VM,
-so you can run Vivado on a big machine without the install ever being
-modified, and without polluting the host.
+so agents on a big machine can run Vivado without the install ever being
+modified and without polluting the host. Agents reach it over MQTT only:
+they create a project, push sources into it, run jobs and pull artifacts back
+on that project's topic. `SPEC.md` is the contract they need.
 
 Nothing is installed: the Vivado tree you already have is squashed as-is.
 
@@ -33,30 +35,29 @@ that bake absolute paths into scripts.
 
 Writable places inside the guest:
 
-| path       | backing               | survives reboot |
-|------------|-----------------------|-----------------|
-| `/` `/tmp` | tmpfs (RAM)           | no              |
-| `/scratch` | `build/scratch.qcow2` | yes, if created |
+| path                 | backing               | survives reboot |
+|----------------------|-----------------------|-----------------|
+| `/` `/tmp`           | tmpfs (RAM)           | no              |
+| `/scratch/projects`  | `build/scratch.qcow2` | yes, if created |
 
-Everything written outside `/scratch` is gone at poweroff, so `make scratch`
-before first boot if you want to keep anything.
+There is no host filesystem share on purpose: the only way in or out is MQTT,
+so an agent needs nothing but a broker address. Run `make scratch` before
+first boot, or projects live in RAM and die with the VM.
 
 ## Using it
 
 On the machine that has Vivado:
 
     make check                       # what's missing
-    cp config.mk.example config.mk   # then edit VIVADO_DIR etc.
+    cp config.mk.example config.mk   # then edit VIVADO_DIR, MQTT_BROKER etc.
     make rootfs                      # minutes
     make vivado                      # hours, and needs ~1x the install size free
-    make scratch                     # persistent disk, do this before booting
+    make scratch                     # where projects live, do this before booting
     make run                         # console on your terminal, ^A x to quit
 
 `make run-bg` daemonizes it and logs the console to `build/console.log`;
-`make stop` kills it, and `make ssh` gets you in:
-
-    make ssh
-    vc-exec vivado -mode batch -source /scratch/build.tcl
+`make stop` kills it. ssh on port 2222 still works for poking around, but it
+is not how work gets submitted.
 
 Every `make rootfs` builds a fresh guest, so the ssh host key changes with it
 and your known_hosts will object. `make ssh` ignores known_hosts for that
@@ -108,18 +109,67 @@ wins over `LICENSE_FILE`. The VM is behind QEMU's user-mode NAT, so it can
 reach a license server on the host at `10.0.2.2`, and nothing can reach the VM
 except the forwarded ssh port.
 
+## Jobs and projects over MQTT
+
+Set `MQTT_BROKER` in `config.mk` and the guest runs `vc-projd`, which owns
+`/scratch/projects` and answers on one topic per project:
+
+    <base>/project/<name>/request        requests in
+    <base>/project/<name>/reply/<req>    replies out
+    <base>/project/<name>/job/<id>/log   job output, line by line
+
+Ops are `create`, `put`, `get`, `rm`, `ls`, `vivado`, `tool`, `version`,
+`jobs`, `cancel`, `destroy`, `status`. Files travel base64'd, chunked when
+large; `vivado` and `tool` stream output to the log topic and end with a final
+reply carrying `rc`, the timing and the last 50 lines, and leave a durable
+record in `.vc/jobs/`. One job at a time per worker, while file operations stay
+responsive. **`SPEC.md` is the full protocol** -- that is the document to hand
+to another agent.
+
+There is deliberately no way to run a command of your choosing: the worker
+builds every argv itself from validated fields, so an agent can drive Vivado
+without reaching a shell. Read "What is contained, and what is not" in
+`SPEC.md` before treating that as a sandbox -- uploaded tcl is still arbitrary
+tcl.
+
+`scripts/vc` is the reference client:
+
+    make vc ARGS="-p demo create"
+    make vc ARGS="-p demo put build.tcl"
+    make vc ARGS="-p demo put rtl/top.v src/top.v"
+    make vc ARGS="-p demo vivado build.tcl --log out/vivado.log"
+    make vc ARGS="-p demo jobs"
+    make vc ARGS="-p demo ls -r"
+    make vc ARGS="-p demo get build/top.bit top.bit"
+    make vc ARGS="-p demo destroy"
+
+It takes `VC_BROKER`, `VC_PROJECT` and friends from the environment too, so
+`scripts/vc -p demo status` works standalone.
+
+To watch the traffic rather than take part in it:
+
+    make watch                    # everything on the base topic
+    make watch PROJECT=demo       # one project
+
 ## What the guest can reach
 
 By default the VM is on a leash that qemu holds, not the guest:
 
-    -netdev user,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22
+    -netdev user,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22,
+            guestfwd=tcp:10.0.2.100:1883-tcp:<your broker>:1883
 
 `restrict=on` drops every packet that is not an explicit rule, so in goes the
-forwarded ssh port and out goes nothing at all: no LAN, no internet, no DNS.
-Since the guest cannot resolve names, Vivado's update and WebTalk checks fail
-immediately rather than hanging, which is why `resolv.conf` names no server.
-Node-locked licensing needs no connectivity, so nothing is lost.
-`NET_RESTRICT=` turns it off if you need the guest online to debug.
+forwarded ssh port and out goes one TCP connection to the broker -- reached
+inside the guest as `10.0.2.100:1883` whatever the broker's real address is.
+Nothing else: no LAN, no internet, no DNS. Since the guest cannot resolve
+names, Vivado's update and WebTalk checks fail immediately rather than
+hanging, which is why `resolv.conf` names no server.
+
+This matters because a build script is arbitrary Tcl and Tcl has `exec`: the
+job can run what it likes inside its project, but it cannot carry anything out
+over the network. Node-locked licensing needs no connectivity, so nothing is
+lost. `NET_RESTRICT=` turns it off if you need the guest online to debug, and
+`GUEST_BROKER` changes the address the guest dials.
 
 ## Trimming the image
 
@@ -161,6 +211,10 @@ of GB takes hours -- force it with `make -B vivado` or by deleting the image.
 * **Overlay size.** `OVERLAY_SIZE=50%` of guest RAM. Vivado writes a lot to
   `$HOME` (`.Xilinx`, journal files); if you hit ENOSPC, raise it or point
   `HOME` at `/scratch`.
+* **Broker limits.** Chunks are sized for a 256 KiB message limit. mosquitto's
+  default is unlimited, but a broker configured with `message_size_limit`
+  lower than that will reject transfers; lower `MAX_CHUNK` in
+  `guest/etc/vivadocontainment/mqtt.conf` to match.
 * **Host keys** are generated at build time and live in the image, so they are
   stable across boots (good for agents) but shared by anyone with the image.
 * **No GUI by default.** `ssh -X` with `xauth` installed should work; the
@@ -170,9 +224,13 @@ of GB takes hours -- force it with `make -B vivado` or by deleting the image.
 
     Makefile                  everything
     config.mk.example         copy to config.mk, gitignored
+    SPEC.md                   the MQTT protocol, for the agents using it
     scripts/license-mac       pull the node-lock MAC out of a .lic
+    scripts/vc                reference MQTT client
     guest/                    files copied verbatim into the image
       etc/initramfs-tools/scripts/vivado   the squashfs+overlay mountroot()
+      etc/vivadocontainment/mqtt.conf      generated from config.mk
       usr/local/bin/vc-exec, vivado        environment wrappers
+      usr/local/sbin/vc-projd              the MQTT project and job service
       usr/local/sbin/vc-fixups             build-time chroot fixups
       usr/local/sbin/vc-scratch            first-boot scratch disk setup

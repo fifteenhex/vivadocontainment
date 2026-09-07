@@ -61,3 +61,12 @@ VIVADO_DIR  = /tools/Xilinx
 # LICENSE_FILE = $(HOME)/.Xilinx/Xilinx.lic
 # MAC = 00:11:22:aa:bb:cc
 
+# MQTT project and job service. Unset = disabled, ssh only. See SPEC.md.
+# MQTT_BROKER = 10.0.2.2
+# MQTT_PORT   = 1883
+# MQTT_TOPIC  = vivado
+# MQTT_WORKER = vivado1
+# MQTT_USER   =
+# MQTT_PASS   =
+# Where projects live in the guest; keep it on the scratch disk.
+# MQTT_ROOT   = /scratch/projects
