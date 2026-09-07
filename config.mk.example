@@ -55,3 +55,9 @@ VIVADO_DIR  = /tools/Xilinx
 # OVERLAY_SIZE = 50%
 # SCRATCH_SIZE = 128G
 
+# Licensing. LICENSE_FILE defaults to ~/.Xilinx/Xilinx.lic or one found in the
+# install; it gets baked into the image and the guest NIC is given the MAC the
+# license is node-locked to (check with: make license-mac).
+# LICENSE_FILE = $(HOME)/.Xilinx/Xilinx.lic
+# MAC = 00:11:22:aa:bb:cc
+

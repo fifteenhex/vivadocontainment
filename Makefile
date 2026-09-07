@@ -53,8 +53,22 @@ VIVADO_EXCLUDE_RE ?= \
 
 # Public key that may ssh in as root.
 SSH_PUBKEY      ?= $(firstword $(wildcard $(HOME)/.ssh/id_ed25519.pub $(HOME)/.ssh/id_rsa.pub))
-# Optional: license server, e.g. 2100@licserver.example.com
+
+# Node-locked license to bake into the image. Node-locked licenses are tied to
+# a NIC address, so the VM is given the same MAC (see MAC below).
+LICENSE_FILE    ?= $(firstword $(wildcard $(HOME)/.Xilinx/Xilinx.lic \
+                     $(VIVADO_DIR)/Xilinx.lic $(VIVADO_DIR)/.Xilinx/Xilinx.lic))
+# Or a floating license server, e.g. 2100@licserver.example.com. Takes
+# precedence over LICENSE_FILE for XILINXD_LICENSE_FILE.
 XILINXD_LICENSE_FILE ?=
+GUEST_LICENSE   := /etc/vivadocontainment/Xilinx.lic
+LICENSE_SPEC     = $(if $(XILINXD_LICENSE_FILE),$(XILINXD_LICENSE_FILE),$(if $(LICENSE_FILE),$(GUEST_LICENSE)))
+
+# MAC address for the guest NIC. Empty means "read it out of LICENSE_FILE",
+# which is what makes a node-locked license valid inside the VM. Override if
+# your license is tied to a different interface than the one it names first.
+MAC             ?=
+GUEST_MAC        = $(if $(MAC),$(MAC),$(shell cat $(BUILD)/mac 2>/dev/null))
 
 # Empty this to give the guest the run of the network again. On, nothing
 # reaches the guest but the forwarded ssh port and the guest reaches nothing
@@ -152,6 +166,7 @@ SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)
 # restrict=on drops everything not named here; hostfwd is the way in and
 # guestfwd the way out, and both are explicit rules that survive it.
 NET_ARGS = $(if $(NET_RESTRICT),$(comma)restrict=on)$(comma)hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22
+MAC_ARG     = $(if $(GUEST_MAC),$(comma)mac=$(GUEST_MAC))
 
 QEMU_ARGS = \
 	-machine q35,accel=$(ACCEL) -cpu $(CPU) -smp $(SMP) -m $(MEM) \
@@ -160,13 +175,13 @@ QEMU_ARGS = \
 	-drive file=$(VIVADO_IMG),if=virtio,format=raw,readonly=on \
 	$(SCRATCH_ARG) \
 	-netdev user,id=n0$(NET_ARGS) \
-	-device virtio-net-pci,netdev=n0 \
+	-device virtio-net-pci,netdev=n0$(MAC_ARG) \
 	-device virtio-rng-pci \
 	$(QEMU_EXTRA)
 
 # ----------------------------------------------------------------- rules ---
 
-.PHONY: all rootfs vivado run run-bg stop ssh sizes deps \
+.PHONY: all rootfs vivado run run-bg stop ssh license-mac sizes deps \
         scratch check clean clean-all info
 
 all: rootfs vivado
@@ -196,16 +211,32 @@ $(VIVADO_IMG): | $(BUILD)
 # Files copied into the guest, with build-time substitutions applied.
 GUEST_SRC := $(shell find guest -type f 2>/dev/null)
 
-$(GUEST): $(GUEST_SRC) Makefile $(wildcard config.mk) | $(BUILD)
+$(GUEST): $(GUEST_SRC) Makefile $(wildcard config.mk) $(LICENSE_FILE) | $(BUILD)
 	rm -rf $@ $@.tmp
 	cp -a guest $@.tmp
-	sed -i 's|@VIVADO_MNT@|$(VIVADO_MNT)|g; s|@LICENSE@|$(XILINXD_LICENSE_FILE)|g' \
+	sed -i 's|@VIVADO_MNT@|$(VIVADO_MNT)|g; s|@LICENSE@|$(LICENSE_SPEC)|g' \
 		$@.tmp/etc/fstab $@.tmp/etc/profile.d/vivado.sh
 	@test -n "$(SSH_PUBKEY)" || { echo "SSH_PUBKEY is empty and no key found in ~/.ssh"; exit 1; }
 	@test -r "$(SSH_PUBKEY)" || { echo "cannot read SSH_PUBKEY=$(SSH_PUBKEY)"; exit 1; }
 	mkdir -p $@.tmp/root/.ssh
 	cp "$(SSH_PUBKEY)" $@.tmp/root/.ssh/authorized_keys
 	chmod 700 $@.tmp/root/.ssh; chmod 600 $@.tmp/root/.ssh/authorized_keys
+	@# A node-locked license only works if the guest NIC matches its HOSTID.
+	rm -f $(BUILD)/mac
+	@if [ -n "$(LICENSE_FILE)" ]; then \
+		mkdir -p $@.tmp/etc/vivadocontainment; \
+		cp "$(LICENSE_FILE)" $@.tmp$(GUEST_LICENSE); \
+		chmod 644 $@.tmp$(GUEST_LICENSE); \
+		mac=$$(scripts/license-mac "$(LICENSE_FILE)"); \
+		if [ -n "$$mac" ]; then \
+			echo "$$mac" > $(BUILD)/mac; \
+			echo "license $(LICENSE_FILE) is node-locked to $$mac, guest NIC will use it"; \
+		else \
+			echo "license $(LICENSE_FILE) has no node-lock HOSTID, not faking a MAC"; \
+		fi; \
+	else \
+		echo "no LICENSE_FILE found, expecting a license server or one inside $(VIVADO_DIR)"; \
+	fi
 	mv $@.tmp $@
 
 INCLUDE := $(subst $(space),$(comma),$(strip $(PACKAGES) $(EXTRA_PACKAGES)))
@@ -213,7 +244,7 @@ INCLUDE := $(subst $(space),$(comma),$(strip $(PACKAGES) $(EXTRA_PACKAGES)))
 # Stamps that change only when a value the step actually uses changes. Without
 # them every edit to config.mk -- including one that only affects the Vivado
 # image -- would rerun mmdebstrap, which is minutes and a network round trip.
-GUEST_VARS  = $(VIVADO_MNT) $(XILINXD_LICENSE_FILE) $(SSH_PUBKEY)
+GUEST_VARS  = $(VIVADO_MNT) $(LICENSE_SPEC) $(SSH_PUBKEY)
 ROOTFS_VARS = $(SUITE) $(MIRROR) $(COMPONENTS) $(ARCH) $(INCLUDE) \
               $(VIVADO_MNT)
 
@@ -235,7 +266,7 @@ $(BUILD)/rootfs.vars: FORCE | $(BUILD)
 # on the tree only in order-only form, so a rebuilt-but-identical tree does
 # not cost a debootstrap.
 $(ROOTFS_TAR): $(GUEST_SRC) $(BUILD)/guest.vars $(BUILD)/rootfs.vars \
-               $(SSH_PUBKEY) | $(GUEST)
+               $(LICENSE_FILE) $(SSH_PUBKEY) | $(GUEST)
 	@command -v mmdebstrap >/dev/null || { echo "need mmdebstrap"; exit 1; }
 	rm -f $@
 	mmdebstrap --mode=unshare --variant=important --arch=$(ARCH) \
@@ -296,6 +327,11 @@ SSH_OPTS = -p $(SSH_PORT) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev
            -o LogLevel=ERROR
 ssh:
 	ssh $(SSH_OPTS) root@$(SSH_HOST)
+
+license-mac:
+	@echo "license  $(if $(LICENSE_FILE),$(LICENSE_FILE),<none found>)"
+	@echo "hostid   $(if $(LICENSE_FILE),$(shell scripts/license-mac $(LICENSE_FILE)),)"
+	@echo "guest    $(if $(GUEST_MAC),$(GUEST_MAC),<qemu default>)"
 
 # --- housekeeping ------------------------------------------------------
 

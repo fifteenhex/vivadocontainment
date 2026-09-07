@@ -1,0 +1,17 @@
+#!/bin/sh
+# Print the MAC address a node-locked Xilinx license is tied to, formatted for
+# qemu (aa:bb:cc:dd:ee:ff). Prints nothing for floating/served licenses, which
+# are not tied to a host id.
+#
+# Xilinx .lic files carry the NIC address as HOSTID=0011223344ee on the
+# INCREMENT lines; FlexLM in the guest recomputes it from eth0, so the VM has
+# to present the same address.
+set -e
+
+[ -n "$1" ] && [ -r "$1" ] || exit 0
+
+hostid=$(grep -oiE 'HOSTID=[0-9a-fA-F]{12}([^0-9a-fA-F]|$)' "$1" |
+	head -1 | cut -d= -f2 | tr 'A-Z' 'a-z' | tr -cd '0-9a-f')
+[ ${#hostid} -eq 12 ] || exit 0
+
+echo "$hostid" | sed 's/../&:/g; s/:$//'

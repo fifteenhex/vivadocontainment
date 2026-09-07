@@ -80,6 +80,34 @@ wrappers:
     vc-exec CMD ...   # run CMD with settings64.sh sourced
     vivado ...        # same, for Vivado itself
 
+## Licensing
+
+The license comes along with the install. `LICENSE_FILE` defaults to the first
+of `~/.Xilinx/Xilinx.lic`, `$VIVADO_DIR/Xilinx.lic`,
+`$VIVADO_DIR/.Xilinx/Xilinx.lic`; it is copied to `/etc/vivadocontainment/Xilinx.lic`
+in the image and pointed at by `XILINXD_LICENSE_FILE`.
+
+Node-locked licenses are tied to a NIC address, and FlexLM inside the guest
+recomputes that from `eth0`, so **the VM has to present the host's MAC**. The
+build reads `HOSTID=` out of the .lic and passes it to qemu:
+
+    make license-mac
+    license  /home/you/.Xilinx/Xilinx.lic
+    hostid   00:11:22:aa:bb:cc
+    guest    00:11:22:aa:bb:cc
+
+Set `MAC` in `config.mk` to override (e.g. if the license names an interface
+other than the one it lists first, or you have several INCREMENT lines with
+different hostids). The kernel gets `net.ifnames=0` so the virtio NIC really is
+`eth0`. Faking the MAC of a machine you own, to run a license you own, on that
+same machine, is the intended use here -- it is a NAT'd VM on the licensed
+host, not a way to move the license elsewhere.
+
+For a floating license set `XILINXD_LICENSE_FILE = 2100@server` instead; it
+wins over `LICENSE_FILE`. The VM is behind QEMU's user-mode NAT, so it can
+reach a license server on the host at `10.0.2.2`, and nothing can reach the VM
+except the forwarded ssh port.
+
 ## What the guest can reach
 
 By default the VM is on a leash that qemu holds, not the guest:
@@ -142,6 +170,7 @@ of GB takes hours -- force it with `make -B vivado` or by deleting the image.
 
     Makefile                  everything
     config.mk.example         copy to config.mk, gitignored
+    scripts/license-mac       pull the node-lock MAC out of a .lic
     guest/                    files copied verbatim into the image
       etc/initramfs-tools/scripts/vivado   the squashfs+overlay mountroot()
       usr/local/bin/vc-exec, vivado        environment wrappers
