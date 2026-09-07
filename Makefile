@@ -239,7 +239,7 @@ $(GUEST): $(GUEST_SRC) Makefile $(wildcard config.mk) $(LICENSE_FILE) | $(BUILD)
 	@# the guest always dials the mapped address; qemu decides where it lands
 	sed -i -e 's|@BROKER@|$(GUEST_BROKER)|' -e 's|@PORT@|$(MQTT_PORT)|' \
 		-e 's|@TOPIC@|$(MQTT_TOPIC)|' -e 's|@WORKER@|$(MQTT_WORKER)|' \
-		-e 's|@ROOT@|$(MQTT_ROOT)|' \
+		-e 's|@ROOT@|$(MQTT_ROOT)|' -e 's|@LICENSE@|$(LICENSE_SPEC)|' \
 		$@.tmp/etc/vivadocontainment/mqtt.conf
 	@# credentials are appended with printf, not sed: a password containing
 	@# & or | would otherwise be mangled into something that silently fails

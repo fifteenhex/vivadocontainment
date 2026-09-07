@@ -217,8 +217,20 @@ Notes for the caller:
 * `rc` is Vivado's exit status. A process killed by a signal reports a
   negative `rc`; on expiry it also carries `"error": "timeout"`, which is what
   distinguishes a timeout from a `cancel`.
-* One job runs at a time per worker; further jobs queue. File operations are
-  served immediately even while a job runs.
+* Work runs in two lanes. The **heavy** lane runs one Vivado at a time --
+  synthesis is the thing that must not be doubled up. The **light** lane runs
+  beside it for small work, so asking a five-second question does not mean
+  waiting out somebody's forty-minute build. File operations are served
+  immediately in either case.
+* `tool` jobs are light by nature. A `vivado` job can ask for the light lane
+  with `"weight": "light"`, and the lane **caps how long it may take**
+  (`LIGHT_MAX_SECONDS`, 300 by default): claiming to be light and then
+  running long gets you killed with `rc: -15` and `"error": "timeout"`, so
+  the claim costs the caller rather than everyone else.
+* The light lane exists only if the licence permits two Vivado checkouts at
+  once -- the worker reads that from the `.lic` at startup, and falls back to
+  one lane when it cannot tell. Heavy jobs also wait for free memory before
+  starting, since `/tmp` is a tmpfs competing for the same RAM.
 * The queue is **round-robin over projects**, FIFO within a project. Queueing
   ten builds does not push a neighbour's single build behind all ten: each
   project takes one turn at a time, and a project that has just appeared is
@@ -328,8 +340,9 @@ agent can pick an idle worker without sending anything.
 project's. With round-robin scheduling the second is what predicts your own
 wait.
 
-`current` is `null` when idle, and otherwise names the job, **the project
-that owns it**, and when it started. The owner is there so that a busy worker
+`running` lists what is in each lane, and `lanes` gives the per-lane queue
+depth. Each entry names the job, **the project that owns it**, its lane, and
+when it started. The owner is there so that a busy worker
 does not read as a stuck one: a job of someone else's, running for twenty
 minutes, is a synthesis, not a fault. You cannot cancel it, and you should
 not go looking for someone who can.

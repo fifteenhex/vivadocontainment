@@ -127,6 +127,28 @@ class FairQueue:
             self.wake.notify_all()
 
 
+class Lane:
+    """A queue with one slot. Heavy work (Vivado itself) gets one lane so
+    that synthesis stays serialised; light work gets another, so an agent
+    asking a five-second question does not wait behind someone's forty
+    minutes."""
+
+    def __init__(self, name):
+        self.name = name
+        self.queue = FairQueue()
+        self.job = None            # id of what is running
+        self.project = None
+        self.op = None
+        self.started = None
+        self.proc = None
+
+    def info(self):
+        if not self.job:
+            return None
+        return {"job": self.job, "project": self.project, "op": self.op,
+                "started": self.started}
+
+
 class Error(Exception):
     """Anything the client did wrong, reported back as ok=false."""
 
@@ -162,12 +184,12 @@ class Service:
         self.root = conf.get("ROOT") or "/scratch/projects"
         self.chunk = int(conf.get("MAX_CHUNK") or 262144)
         self.me = f"{self.base}/worker/{self.worker}"
-        self.jobs = FairQueue()
-        self.current = None
-        self.current_project = None
-        self.proc = None
-        self.current_started = None
-        self.current_op = None
+        self.lanes = {"heavy": Lane("heavy"), "light": Lane("light")}
+        # A light lane means a second Vivado may run beside a synthesis, so
+        # it exists only if the licence permits two checkouts at once.
+        self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
+        self.heavy_mem_min = int(conf.get("HEAVY_MEM_MIN_MB") or 4096)
+        self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
         # reaches them, since a queue cannot be reached into.
         self.cancelled = set()
@@ -212,6 +234,47 @@ class Service:
         if must_exist and not os.path.exists(full):
             raise Error(f"no such path: {path}")
         return full
+
+    def licence_allows_two(self, conf):
+        """Whether a second Vivado may run alongside the first.
+
+        FlexLM collapses duplicate checkouts by the same user on the same
+        host into one seat when the licence says DUP_GROUP=UHD, which
+        node-locked Xilinx licences normally do. Otherwise the INCREMENT
+        count is the ceiling. When it cannot be read, assume one: refusing
+        to parallelise costs time, guessing wrong costs a failed build.
+        """
+        if (conf.get("LIGHT_LANE") or "auto").lower() in ("no", "0", "off"):
+            log("light lane disabled by configuration")
+            return False
+        path = conf.get("LICENSE") or "/etc/vivadocontainment/Xilinx.lic"
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            log(f"no licence at {path}: one job at a time")
+            return False
+        if "DUP_GROUP=UHD" in text.replace(" ", ""):
+            log("licence groups duplicate checkouts (DUP_GROUP=UHD): "
+                "light lane enabled")
+            return True
+        counts = [int(m) for m in re.findall(r"^INCREMENT\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)",
+                                            text, re.M)]
+        if counts and min(counts) >= 2:
+            log(f"licence allows {min(counts)} at once: light lane enabled")
+            return True
+        log("licence looks single-seat: one job at a time")
+        return False
+
+    def memory_free_mb(self):
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except OSError:
+            pass
+        return None
 
     def boot_id(self):
         """Changes when the machine reboots and not when the daemon
@@ -390,28 +453,37 @@ class Service:
         body.setdefault("ok", True)
         self.publish(f"{self.base}/project/{project}/reply/{req}", body)
 
+    def queued_jobs(self):
+        return [j for lane in self.lanes.values() for j in lane.queue.snapshot()]
+
     def pending(self):
         """Queued jobs that have not been cancelled out from under us."""
         with self.lock:
             cancelled = set(self.cancelled)
-        return sum(1 for j in self.jobs.snapshot() if j["id"] not in cancelled)
+        return sum(1 for j in self.queued_jobs() if j["id"] not in cancelled)
 
-    def current_info(self):
-        """Attributed, and with a start time. A bare job id sent one agent
-        looking for the owner and it cancelled a stranger's synthesis."""
+    def running(self):
+        """What is in each slot. Attributed, and with a start time: a bare
+        job id sent one agent looking for the owner and it cancelled a
+        stranger's synthesis."""
         with self.lock:
-            if not self.current:
-                return None
-            return {"job": self.current, "project": self.current_project,
-                    "op": self.current_op, "started": self.current_started}
+            return [dict(lane.info(), lane=name)
+                    for name, lane in self.lanes.items() if lane.info()]
+
+    def busy(self):
+        with self.lock:
+            return any(lane.job for lane in self.lanes.values())
 
     def publish_status(self):
         self.publish(f"{self.me}/status", {
             "worker": self.worker,
             "boot": self.boot,
             "persistent": self.persistent(),
-            "busy": self.current is not None,
-            "current": self.current_info(),
+            "busy": self.busy(),
+            "running": self.running(),
+            "lanes": {name: {"queued": len(lane.queue.snapshot()),
+                             "running": lane.info()}
+                      for name, lane in self.lanes.items()},
             "queued": self.pending(),
             "root": self.root,
             "projects": self.projects(),
@@ -442,13 +514,13 @@ class Service:
 
     def op_destroy(self, project, req, body):
         with self.lock:
-            busy = self.current_project == project
+            busy = any(lane.project == project for lane in self.lanes.values())
         if busy:
             raise Error("a job is running in this project; cancel it first")
         # Queued work for this project is part of "everything in it";
         # refusing here left projects wedged behind a queue that could not be
         # emptied.
-        pending = [j for j in self.jobs.snapshot() if j["project"] == project]
+        pending = [j for j in self.queued_jobs() if j["project"] == project]
         if pending:
             self.drop_queued(project, pending)
         path = self.project_dir(project)
@@ -595,9 +667,9 @@ class Service:
         self.publish_status()
         self.reply(project, req, {
             "op": "status", "exists": os.path.isdir(path), "path": path,
-            "busy": self.current is not None, "current": self.current_info(),
+            "busy": self.busy(), "running": self.running(),
             "queued": self.pending(), "projects": self.projects(),
-            "queued_here": sum(1 for j in self.jobs.snapshot()
+            "queued_here": sum(1 for j in self.queued_jobs()
                                if j["project"] == project),
         })
 
@@ -621,6 +693,16 @@ class Service:
             out.append(str(arg))
         return out
 
+    def lane_for(self, op, body):
+        """tool work is light by nature. A vivado job can ask to be light --
+        reading a report rather than routing a design -- and the light lane
+        caps how long it may take, so the claim costs the caller rather than
+        everyone else."""
+        wants_light = op == "tool" or body.get("weight") == "light"
+        if wants_light and self.light_ok:
+            return self.lanes["light"]
+        return self.lanes["heavy"]
+
     def queue_job(self, project, req, argv, body, op):
         if not os.path.isdir(self.project_dir(project)):
             raise Error(f"project {project} does not exist, create it first")
@@ -629,6 +711,7 @@ class Service:
             "req": req,
             "op": op,
             "queued": int(time.time()),
+            "weight": body.get("weight"),
             "id": self.check_job_id(body.get("job")),
             "cmd": argv,
             "cwd": as_str(body.get("cwd") or "", "cwd"),
@@ -645,7 +728,12 @@ class Service:
             "op": op, "job": job["id"], "state": "queued",
             "log": f"{self.base}/project/{project}/job/{job['id']}/log",
         }, final=False)
-        self.jobs.put(job)
+        lane = self.lane_for(op, body)
+        if lane.name == "light" and (not job["timeout"]
+                                     or job["timeout"] > self.light_cap):
+            job["timeout"] = self.light_cap
+        job["lane"] = lane.name
+        lane.queue.put(job)
         self.publish_status()
 
     def op_vivado(self, project, req, body):
@@ -725,12 +813,12 @@ class Service:
         records.sort(key=lambda r: r.get("queued", 0), reverse=True)
         self.reply(project, req, {"op": "jobs", "jobs": records})
 
-    def stop_proc(self, sig=signal.SIGTERM):
+    def stop_proc(self, lane, sig=signal.SIGTERM):
         """Signal the whole process group. Build tcl uses exec, so killing
         just vivado leaves its children holding the pipe open and the job
         slot with it."""
         with self.lock:
-            proc = self.proc
+            proc = lane.proc
         if proc is None or proc.poll() is not None:
             return False
         try:
@@ -761,13 +849,14 @@ class Service:
     def op_cancel(self, project, req, body):
         target = body.get("job")
         with self.lock:
-            running = (self.current == target
-                       and self.current_project == project)
-        if running and self.stop_proc():
+            here = next((lane for lane in self.lanes.values()
+                         if lane.job == target and lane.project == project),
+                        None)
+        if here and self.stop_proc(here):
             self.reply(project, req, {"op": "cancel", "job": target,
                                       "cancelled": True, "state": "running"})
             return
-        queued = [j for j in self.jobs.snapshot()
+        queued = [j for j in self.queued_jobs()
                   if j["id"] == target and j["project"] == project]
         if queued:
             self.drop_queued(project, queued)
@@ -806,7 +895,7 @@ class Service:
             json.dump(record, f, indent=1)
         os.replace(tmp, path)          # readers must never see a half record
 
-    def run_job(self, job):
+    def run_job(self, lane, job):
         project, job_id, req = job["project"], job["id"], job["req"]
         logtopic = f"{self.base}/project/{project}/job/{job_id}/log"
         workdir = self.resolve(project, job["cwd"])
@@ -828,8 +917,8 @@ class Service:
             env["USER"] = env["LOGNAME"] = f"vcp{uid}"
 
         with self.lock:
-            self.current, self.current_project = job_id, project
-            self.current_started, self.current_op = int(time.time()), job["op"]
+            lane.job, lane.project = job_id, project
+            lane.op, lane.started = job["op"], int(time.time())
         self.publish_status()
         self.reply(project, req, {"op": job["op"], "job": job_id,
                                   "state": "running", "log": logtopic},
@@ -858,13 +947,13 @@ class Service:
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     start_new_session=True, **creds)
                 with self.lock:
-                    self.proc = proc
+                    lane.proc = proc
                 # A silent Vivado run still has to hit its timeout, so kill it
                 # from a timer rather than from the output loop.
                 timer = None
                 if job["timeout"]:
                     timer = threading.Timer(float(job["timeout"]),
-                                            self.stop_proc)
+                                            lambda: self.stop_proc(lane))
                     timer.start()
                 for raw in proc.stdout:
                     logfile.write(raw)
@@ -883,15 +972,15 @@ class Service:
         finally:
             # Whatever went wrong up there, the build must not outlive the
             # job: an abandoned Vivado holds the licence and the job slot.
-            if self.stop_proc(signal.SIGKILL):
+            if self.stop_proc(lane, signal.SIGKILL):
                 log(f"{project}/{job_id}: killed an abandoned process group")
-            if self.proc is not None:
+            if lane.proc is not None:
                 try:
-                    self.proc.wait(timeout=10)
+                    lane.proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     log(f"{project}/{job_id}: process group would not die")
             with self.lock:
-                self.proc = None
+                lane.proc = None
 
         # ok means the request was carried out; whether the build passed is
         # rc's business, so a failing Vivado run is not a protocol error.
@@ -909,7 +998,7 @@ class Service:
         self.reply(project, req, result)
         log(f"{project}/{job_id}: rc={rc} in {result['seconds']}s")
         with self.lock:
-            self.current, self.current_project = None, None
+            lane.job = lane.project = lane.op = lane.started = None
         self.publish_status()
 
     # -- main loop -------------------------------------------------------
@@ -959,8 +1048,20 @@ class Service:
         self.client.connect_async(host, int(self.conf.get("PORT") or 1883),
                                   keepalive=30)
         self.client.loop_start()
+        workers = [threading.Thread(target=self.serve_lane, args=(lane,),
+                                    name=f"lane-{name}", daemon=True)
+                   for name, lane in self.lanes.items()]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        return 0
+
+    def serve_lane(self, lane):
+        """One slot per lane: take a job, run it to completion, take the
+        next."""
         while True:
-            job = self.jobs.get()
+            job = lane.queue.get()
             if job is None:
                 break
             with self.lock:
@@ -970,16 +1071,35 @@ class Service:
                 log(f"{job['project']}/{job['id']}: cancelled before it ran")
                 self.publish_status()
                 continue
+            if lane.name == "heavy":
+                self.wait_for_memory(job)
             try:
-                self.run_job(job)
+                self.run_job(lane, job)
             except Exception as e:
                 log(f"job failed: {e}")
                 self.reply(job["project"], job["req"],
                            {"op": job["op"], "job": job["id"], "ok": False,
                             "error": str(e)})
-                self.current = None
+                with self.lock:
+                    lane.job = lane.project = None
                 self.publish_status()
-        return 0
+
+    def wait_for_memory(self, job):
+        """Hold a fat job at the door until there is room for it. /tmp is a
+        tmpfs on the same RAM the synthesis wants, so starting one that
+        cannot fit gets the OOM killer rather than a slow build."""
+        waited = 0
+        while True:
+            free = self.memory_free_mb()
+            if free is None or free >= self.heavy_mem_min:
+                if waited:
+                    log(f"{job['project']}/{job['id']}: {free} MB free, starting")
+                return
+            if waited % 60 == 0:
+                log(f"{job['project']}/{job['id']}: waiting for memory, "
+                    f"{free} MB free, want {self.heavy_mem_min} MB")
+            time.sleep(5)
+            waited += 5
 
 
 def main():
