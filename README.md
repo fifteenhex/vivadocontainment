@@ -86,7 +86,8 @@ wrappers:
 The license comes along with the install. `LICENSE_FILE` defaults to the first
 of `~/.Xilinx/Xilinx.lic`, `$VIVADO_DIR/Xilinx.lic`,
 `$VIVADO_DIR/.Xilinx/Xilinx.lic`; it is copied to `/etc/vivadocontainment/Xilinx.lic`
-in the image and pointed at by `XILINXD_LICENSE_FILE`.
+in the image, world-readable because jobs run as unprivileged per-project
+users, and pointed at by `XILINXD_LICENSE_FILE`.
 
 Node-locked licenses are tied to a NIC address, and FlexLM inside the guest
 recomputes that from `eth0`, so **the VM has to present the host's MAC**. The
@@ -128,9 +129,10 @@ to another agent.
 
 There is deliberately no way to run a command of your choosing: the worker
 builds every argv itself from validated fields, so an agent can drive Vivado
-without reaching a shell. Read "What is contained, and what is not" in
-`SPEC.md` before treating that as a sandbox -- uploaded tcl is still arbitrary
-tcl.
+without reaching a shell. Each project's jobs then run as that project's own
+unprivileged uid, in a directory only it can read or write, so tcl that does
+reach `exec` can wreck its own project and nothing else. Read "What is
+contained, and what is not" in `SPEC.md` for where that stops.
 
 `scripts/vc` is the reference client:
 

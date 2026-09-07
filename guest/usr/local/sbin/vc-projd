@@ -20,6 +20,7 @@ import base64
 import binascii
 import json
 import os
+import pwd
 import re
 import shutil
 import signal
@@ -149,6 +150,13 @@ class Service:
     def __init__(self, conf):
         self.conf = conf
         self.boot = self.boot_id()
+        self.uid_base = int(conf.get("UID_BASE") or 3000)
+        want_users = (conf.get("RUN_AS_USER") or "yes").lower() \
+            not in ("no", "0", "false", "off")
+        self.run_as_user = want_users and os.geteuid() == 0
+        if want_users and not self.run_as_user:
+            log("warning: not running as root, so jobs cannot drop privileges "
+                "-- they run as this user and can write outside their project")
         self.worker = conf.get("WORKER") or "vivado1"
         self.base = (conf.get("TOPIC") or "vivado").rstrip("/")
         self.root = conf.get("ROOT") or "/scratch/projects"
@@ -181,9 +189,9 @@ class Service:
         return os.path.join(self.root, project)
 
     def writable(self, project, path):
-        """.vc is the daemon's: job records and logs live there, and a
-        client that can write them can forge its own results. Reading it
-        stays allowed."""
+        """.vc is the daemon's: uid, job records and logs live there, and a
+        client that can write them can forge its own results or its own
+        privileges. Reading it stays allowed."""
         full = self.resolve(project, path)
         base = os.path.realpath(self.project_dir(project))
         vc = os.path.join(base, ".vc")
@@ -223,14 +231,94 @@ class Service:
         except OSError:
             return False
 
+    def meta_dir(self):
+        """Daemon bookkeeping, outside every project and unreachable from
+        one: a job that owns its project directory must not be able to
+        rewrite the uid it runs as."""
+        path = os.path.join(self.root, ".meta")
+        os.makedirs(path, exist_ok=True)
+        if self.run_as_user:
+            os.chown(path, 0, 0)
+            os.chmod(path, 0o700)
+        return path
+
+    def project_uid(self, project):
+        """Every project runs as its own uid, so a job can wreck its own
+        directory -- which is its business -- and reach no other."""
+        if not self.run_as_user:
+            return None
+        if not NAME_RE.match(project):
+            raise Error(f"bad project name {project!r}")
+        uidfile = os.path.join(self.meta_dir(), project + ".uid")
+        if os.path.exists(uidfile):
+            with open(uidfile) as f:
+                uid = int(f.read().strip())
+            if not self.uid_base <= uid < self.uid_base + 10000:
+                raise Error(f"recorded uid {uid} for {project} is out of range")
+        else:
+            used = set()
+            for name in os.listdir(self.meta_dir()):
+                if not name.endswith(".uid"):
+                    continue
+                try:
+                    with open(os.path.join(self.meta_dir(), name)) as f:
+                        used.add(int(f.read().strip()))
+                except (OSError, ValueError):
+                    continue
+            uid = self.uid_base
+            while uid in used:
+                uid += 1
+            with open(uidfile, "w") as f:
+                f.write(str(uid))
+        self.ensure_user(uid)
+        return uid
+
+    def ensure_user(self, uid):
+        """/etc lives in the tmpfs overlay, so accounts have to be recreated
+        every boot; the uid on disk is what actually persists."""
+        try:
+            pwd.getpwuid(uid)
+            return
+        except KeyError:
+            pass
+        name = f"vcp{uid}"
+        for cmd in (["groupadd", "-g", str(uid), name],
+                    ["useradd", "-u", str(uid), "-g", str(uid), "-M", "-N",
+                     "-s", "/usr/sbin/nologin", name]):
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+            except OSError:
+                log(f"cannot run {cmd[0]}, falling back to /etc/passwd")
+                with open("/etc/group", "a") as f:
+                    f.write(f"{name}:x:{uid}:\n")
+                with open("/etc/passwd", "a") as f:
+                    f.write(f"{name}:x:{uid}:{uid}::/nonexistent:"
+                            f"/usr/sbin/nologin\n")
+                return
+
     def make_parent(self, project, path):
         """Vivado opens -log before the tcl runs, so the script cannot create
         the directory itself; mkdir -p is what every wrapper did first."""
         full = self.resolve(project, path)
         parent = os.path.dirname(full)
-        if parent:
+        if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
+            base = os.path.realpath(self.project_dir(project))
+            while parent.startswith(base) and parent != base:
+                self.own(project, parent)
+                parent = os.path.dirname(parent)
         return full
+
+    def own(self, project, path):
+        """Hand a path the daemon just wrote to the project's own user."""
+        uid = self.project_uid(project)
+        if uid is None:
+            return
+        try:
+            os.chown(path, uid, uid)
+        except OSError as e:
+            log(f"cannot chown {path}: {e}")
 
     def projects(self):
         try:
@@ -338,9 +426,19 @@ class Service:
         os.makedirs(os.path.join(path, ".vc", "jobs"), exist_ok=True)
         home = os.path.join(path, ".vc", "home")
         os.makedirs(home, exist_ok=True)
+        uid = self.project_uid(project)
+        if uid is not None:
+            # root:uid 1770 -- the job creates and deletes its own files, the
+            # neighbours see nothing, and the sticky bit stops it removing
+            # root-owned .vc to get at its own job records. Only .vc/home,
+            # which is the job's HOME, belongs to the job.
+            os.chown(path, 0, uid)
+            os.chmod(path, 0o1770)
+            os.chmod(os.path.join(path, ".vc"), 0o755)
+            self.own(project, home)
         self.publish_status()
         self.reply(project, req, {"op": "create", "path": path,
-                                  "existed": existed})
+                                  "existed": existed, "uid": uid})
 
     def op_destroy(self, project, req, body):
         with self.lock:
@@ -425,6 +523,12 @@ class Service:
 
         if body.get("mode"):
             os.chmod(full, int(str(body["mode"]), 8))
+        self.own(project, full)
+        parent = os.path.dirname(full)
+        base_dir = os.path.realpath(self.project_dir(project))
+        while parent.startswith(base_dir) and parent != base_dir:
+            self.own(project, parent)
+            parent = os.path.dirname(parent)
         base = os.path.realpath(self.project_dir(project))
         self.reply(project, req, {"op": "put", "path": os.path.relpath(full, base),
                                   "size": os.path.getsize(full),
@@ -714,6 +818,14 @@ class Service:
         # No caller-supplied environment: LD_PRELOAD alone would undo the
         # point of taking arbitrary commands away.
         env = dict(os.environ)
+        uid = self.project_uid(project)
+        if uid is not None:
+            home = self.resolve(project, os.path.join(".vc", "home"))
+            os.makedirs(home, exist_ok=True)
+            self.own(project, home)
+            self.own(project, workdir)
+            env["HOME"] = home
+            env["USER"] = env["LOGNAME"] = f"vcp{uid}"
 
         with self.lock:
             self.current, self.current_project = job_id, project
@@ -735,11 +847,16 @@ class Service:
         try:
             with open(logpath, "wb") as logfile:
                 # vc-exec sources settings64.sh before exec'ing the command.
+                # user/group rather than preexec_fn: this process has three
+                # threads, and running Python between fork and exec is how
+                # you deadlock a daemon.
+                creds = {} if uid is None else {
+                    "user": uid, "group": uid, "extra_groups": []}
                 proc = subprocess.Popen(
                     [VC_EXEC] + job["cmd"], cwd=workdir,
                     env=env, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    start_new_session=True)
+                    start_new_session=True, **creds)
                 with self.lock:
                     self.proc = proc
                 # A silent Vivado run still has to hit its timeout, so kill it
@@ -826,6 +943,16 @@ class Service:
             return 0
         os.makedirs(self.root, exist_ok=True)
         self.reconcile()
+        if self.run_as_user:
+            # Root-owned and not writable by any job, so one project cannot
+            # rename or delete another.
+            os.chmod(self.root, 0o755)
+            os.chown(self.root, 0, 0)
+            for project in self.projects():
+                try:
+                    self.project_uid(project)
+                except Error:
+                    continue
         if not os.path.ismount("/scratch") and self.root.startswith("/scratch"):
             log("warning: /scratch is not mounted, projects live in RAM and "
                 "die with the VM (make scratch)")

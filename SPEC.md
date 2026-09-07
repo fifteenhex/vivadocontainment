@@ -85,10 +85,13 @@ to a malformed request; every other failure comes back as `ok: false`.
 
 ```json
 {"req": "1", "op": "create"}
--> {"ok": true, "final": true, "path": "/scratch/projects/demo", "existed": false}
+-> {"ok": true, "final": true, "path": "/scratch/projects/demo",
+    "existed": false, "uid": 3000}
 ```
 
-Idempotent. Creates the project directory and its `.vc` bookkeeping dir.
+Idempotent. Creates the project directory and its `.vc` bookkeeping dir, and
+allocates the uid this project's jobs will run as. `uid` is null when the
+worker is not running as root and cannot drop privileges.
 
 ### destroy
 
@@ -171,7 +174,8 @@ been run.
 
 `.vc` is **read-only**: `put` and `rm` into it are refused. It holds the job
 records and the staging area for chunked uploads, and a client that could
-rewrite those could forge its own results.
+rewrite those could forge its own results -- or, when the worker runs as
+root, the uid its jobs run as.
 
 ### vivado
 
@@ -380,11 +384,20 @@ project: absolute paths are refused and `../` cannot escape.
 **The tcl you upload is arbitrary Tcl, and Tcl has `exec`.** Real build
 scripts use it -- `exec find`, `file delete -force`, `file copy` are all in
 the scripts this was built for -- so it is not filtered, and no attempt is
-made to parse your way out of the problem. A job can therefore reach other
-programs in the guest, and the isolation boundary is the VM: a read-only
-Vivado and a root filesystem thrown away at poweroff.
+made to parse your way out of the problem.
 
-The broker needs credentials and a topic ACL too, since publishing to a
+Instead the job is confined by who it runs as. Every project is assigned its
+own uid (recorded in `.vc/uid`, reported by `create`) and its directory is
+`0700` owned by that user. A job therefore runs as a user that can write its
+own project and nothing else: it can delete its own sources, corrupt its own
+bitstream and `exec` whatever it likes doing so, which is between the agent
+and its own project. It cannot touch another project, the Vivado install
+(read-only), or the guest system, and it has no privileges to regain.
+
+What is left: `/tmp` is shared between projects, most of the guest is
+world-readable, and the network is reachable. The VM remains the outer
+boundary -- a read-only Vivado, a root filesystem thrown away at poweroff --
+and the broker still needs credentials and a topic ACL, since publishing to a
 project topic is what grants all of this in the first place.
 
 The same applies to the broker. Anyone who can publish to
