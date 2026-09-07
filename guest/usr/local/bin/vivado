@@ -1,0 +1,25 @@
+#!/bin/bash
+# Wrapper so `vivado ...` works from any shell, login or not. bash for the
+# same reason as vc-exec: settings64.sh is a bash script.
+set -e
+# Not fatal: settings64.sh sources a fragment per sibling component, and
+# a component that is not installed -- or that the image filter dropped --
+# is normal. Xilinx's script survives it; set -e in the caller would not.
+set +e
+. /etc/profile.d/vivado.sh
+set -e
+if [ -z "${XILINX_VIVADO}" ]; then
+	# This runs over MQTT as often as not, so say which failure it is
+	# rather than leaving the caller to go and look.
+	echo "vivado: no settings64.sh found under ${VIVADO_ROOT}" >&2
+	if [ ! -d "${VIVADO_ROOT}" ]; then
+		echo "vivado: that directory does not exist -- VIVADO_MNT is wrong" >&2
+	elif [ -z "$(ls -A "${VIVADO_ROOT}" 2>/dev/null)" ]; then
+		echo "vivado: it is empty -- the image is not mounted" >&2
+	else
+		echo "vivado: it contains: $(ls "${VIVADO_ROOT}" | head -8 | tr '\n' ' ')" >&2
+		echo "vivado: so the install is there but laid out unexpectedly" >&2
+	fi
+	exit 1
+fi
+exec "${XILINX_VIVADO}/bin/vivado" "$@"

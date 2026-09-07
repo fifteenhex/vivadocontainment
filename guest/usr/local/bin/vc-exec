@@ -1,0 +1,15 @@
+#!/bin/bash
+# Run a command with the Vivado environment set up, e.g.
+#   ssh vm vc-exec vivado -mode batch -source build.tcl
+#
+# bash, not sh: Xilinx's own settings64.sh is a bash script -- it uses
+# source and BASH_SOURCE to find its own directory -- so under dash it dies
+# on the first line and leaves the environment empty.
+set -e
+# Not fatal: settings64.sh sources a fragment per sibling component, and
+# a component that is not installed -- or that the image filter dropped --
+# is normal. Xilinx's script survives it; set -e in the caller would not.
+set +e
+. /etc/profile.d/vivado.sh
+set -e
+exec "$@"

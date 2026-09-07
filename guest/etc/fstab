@@ -1,0 +1,4 @@
+# / is a squashfs + tmpfs overlay assembled in the initramfs, not listed here.
+# Projects live on the scratch disk, mounted by vc-scratch.
+/dev/vdb	@VIVADO_MNT@	erofs	ro,nofail	0 0
+tmpfs		/tmp		tmpfs		rw,nosuid,nodev,size=50%	0 0

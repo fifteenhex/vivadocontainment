@@ -1,0 +1,40 @@
+#!/bin/sh
+# Run once at image build time, inside the chroot.
+set -e
+
+# Vivado (2019.x .. 2023.x) links against the ncurses 5 sonames, which no
+# longer exist in Debian. The ABI it actually uses is compatible enough that
+# the symlinks work; if your version chokes, install the real libtinfo5 and
+# libncurses5 debs from bullseye instead (see README).
+libdir=/usr/lib/x86_64-linux-gnu
+for lib in tinfo ncurses ncursesw form menu panel; do
+	if [ -e "${libdir}/lib${lib}.so.6" ] && [ ! -e "${libdir}/lib${lib}.so.5" ]; then
+		ln -s "lib${lib}.so.6" "${libdir}/lib${lib}.so.5"
+	fi
+done
+ldconfig
+
+# Vivado does not merely prefer en_US.UTF-8: rdiArgs.sh sets LC_ALL to it
+# and the C++ runtime throws if the locale does not exist, so Vivado aborts
+# with SIGABRT before it reads your script. Generating it at build time is
+# the only place that lasts -- / is a tmpfs overlay at runtime.
+sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
+grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null \
+	|| echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+locale-gen
+echo 'LANG=en_US.UTF-8' > /etc/default/locale
+
+# sshd's StrictModes refuses an authorized_keys that the account does not
+# own, and the file arrives here from the build host's tree.
+if [ -d /root/.ssh ]; then
+	chown -R root:root /root/.ssh
+	chmod 700 /root/.ssh
+	[ -f /root/.ssh/authorized_keys ] && chmod 600 /root/.ssh/authorized_keys
+fi
+
+# No password login anywhere; keys only.
+passwd -l root >/dev/null 2>&1 || true
+
+# Nothing here is worth waiting for at boot.
+systemctl disable e2scrub_reap.service >/dev/null 2>&1 || true
+systemctl mask systemd-random-seed.service >/dev/null 2>&1 || true

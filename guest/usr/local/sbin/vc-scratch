@@ -1,0 +1,14 @@
+#!/bin/sh
+# Mount the optional scratch disk at /scratch, formatting it the first time.
+# Without one, /scratch is just part of the root overlay (i.e. RAM).
+set -e
+dev=/dev/vdc
+
+[ -b "${dev}" ] || exit 0
+if ! blkid "${dev}" >/dev/null 2>&1; then
+	echo "vc-scratch: formatting ${dev}"
+	mkfs.ext4 -q -L scratch "${dev}"
+fi
+mkdir -p /scratch
+mount -o nosuid,nodev "${dev}" /scratch
+chmod 1777 /scratch

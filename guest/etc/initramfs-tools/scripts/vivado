@@ -1,0 +1,63 @@
+# vivadocontainment root mounting, selected with boot=vivado on the kernel
+# command line. initramfs-tools sources this file and calls mountroot().
+#
+# /dev/vda  read-only squashfs, the guest system
+# tmpfs     everything written at runtime, thrown away at poweroff
+#
+# The overlay parts live under /run, which initramfs-tools moves into the
+# real root at switch_root, so the mounts survive.
+
+mountroot()
+{
+	local size dev i
+
+	[ -n "${ROOT}" ] || ROOT=/dev/vda
+
+	# No sed here: initramfs-tools may be using klibc rather than busybox,
+	# and klibc has almost nothing. The shell can do this itself.
+	size=
+	for arg in $(cat /proc/cmdline); do
+		case "${arg}" in
+		overlay_size=*) size="${arg#overlay_size=}" ;;
+		esac
+	done
+	[ -n "${size}" ] || size=50%
+
+	for mod in virtio_pci virtio_blk virtio_net loop squashfs overlay; do
+		modprobe -q "${mod}" || true
+	done
+
+	wait_for_udev 10
+
+	i=0
+	while [ ! -b "${ROOT}" ] && [ ${i} -lt 30 ]; do
+		[ $((i % 5)) -eq 0 ] && echo "vivadocontainment: waiting for ${ROOT}..."
+		sleep 1
+		i=$((i + 1))
+	done
+	if [ ! -b "${ROOT}" ]; then
+		# Say what the box actually has, or the panic is unactionable and
+		# panic= turns it into a reboot loop that scrolls the message away.
+		echo "vivadocontainment: ${ROOT} never appeared. block devices:"
+		ls /dev/vd* /dev/sd* /dev/nvme* 2>/dev/null || echo "  (none)"
+		echo "vivadocontainment: modules loaded:"
+		cat /proc/modules
+		panic "vivadocontainment: no root device ${ROOT}"
+	fi
+
+	mkdir -p /run/rootfs
+	mount -t tmpfs -o mode=0755,size="${size}" tmpfs /run/rootfs \
+		|| panic "vivadocontainment: cannot mount overlay tmpfs (size=${size})"
+	mkdir -p /run/rootfs/lower /run/rootfs/upper /run/rootfs/work
+
+	mount -t squashfs -o ro "${ROOT}" /run/rootfs/lower \
+		|| mount -t erofs -o ro "${ROOT}" /run/rootfs/lower \
+		|| panic "vivadocontainment: ${ROOT} mounts as neither squashfs nor erofs"
+
+	# Options first: klibc's mount is "mount [-o opts] [-t type] dev dir"
+	# and rejects anything after the device, which is where this went wrong.
+	mount -t overlay \
+		-o lowerdir=/run/rootfs/lower,upperdir=/run/rootfs/upper,workdir=/run/rootfs/work \
+		overlay "${rootmnt}" \
+		|| panic "vivadocontainment: cannot mount the overlay"
+}

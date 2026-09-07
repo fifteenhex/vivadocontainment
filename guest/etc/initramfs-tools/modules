@@ -1,0 +1,7 @@
+virtio_pci
+virtio_blk
+virtio_net
+virtio_console
+squashfs
+overlay
+loop

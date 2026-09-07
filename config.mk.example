@@ -1,0 +1,57 @@
+# Copy to config.mk and edit. config.mk is gitignored.
+
+# The Vivado install to containerise, and where it lands in the guest.
+VIVADO_DIR  = /tools/Xilinx
+# VIVADO_MNT = $(VIVADO_DIR)
+
+# Whole tools you never use, as exact paths under VIVADO_DIR:
+# VIVADO_EXCLUDES = Vitis Model_Composer
+# Regexes matched against every path; setting this REPLACES the built-in
+# default, so copy that from the Makefile first. See "make sizes" for what
+# each one is worth on your install.
+#
+# The default drops only what the protocol cannot reach. These are the next
+# big ones, and each needs a decision because it removes something real
+# (sizes are from a 60G 2026.1 install):
+#
+#   (^|/)data/parts/xilinx/(zynq|versal|kintex|virtex|spartan|.*ultra)
+#                           5.2G  device families you do not target. Keep
+#                                 artix7 AND aartix7 -- MIG's fpga_tlib
+#                                 references the automotive variant. Verify
+#                                 with a real build before trusting it.
+#   (^|/)data/xsim/         4.4G  breaks xvlog/xelab/xsim -- drop if you
+#                                 simulate locally rather than on the worker
+#   (^|/)data/secureip/     3.4G  encrypted models, simulation only
+#   (^|/)ids_lite/          3.5G  legacy ISE data, needed by a few old flows
+#   (^|/)tps/llvm/          2.5G  used by HLS, not by synthesis
+#   (^|/)clang-16/          2.8G  ditto
+#
+# Do NOT exclude doc/ or docs/. Under data/ip/xilinx they hold changelogs and
+# XML that Vivado copies as IP generation deliverables, and MIG's device
+# database lives in one; stripping them makes every IP fail to generate.
+#
+# VIVADO_EXCLUDE_RE = ... (^|/)data/xsim/ (^|/)ids_lite/
+
+# SSH_PUBKEY = $(HOME)/.ssh/id_ed25519.pub
+# XILINXD_LICENSE_FILE = 2100@licserver.example.com
+
+# Guest base system. bullseye if bookworm's glibc/ncurses upsets your Vivado.
+# SUITE = bookworm
+# EXTRA_PACKAGES = build-essential gdb tmux
+
+# Compression for the Vivado image, in mkfs.erofs's -z syntax. zstd,19 is the
+# smallest and takes hours on a full install; lz4 builds and reads much faster
+# and is appreciably bigger, which is the trade you want while iterating.
+# VIVADO_COMP = lz4
+#
+# The rootfs is squashfs and small; this rarely matters.
+# ROOTFS_COMP = zstd
+# ROOTFS_COMP_LEVEL = 19
+
+# VM sizing.
+# MEM = 32G
+# SMP = 16
+# SSH_PORT = 2222
+# OVERLAY_SIZE = 50%
+# SCRATCH_SIZE = 128G
+
