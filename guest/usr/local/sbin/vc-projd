@@ -188,6 +188,7 @@ class Service:
         # A light lane means a second Vivado may run beside a synthesis, so
         # it exists only if the licence permits two checkouts at once.
         self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
+        self.light_reason = "unknown"
         self.heavy_mem_min = int(conf.get("HEAVY_MEM_MIN_MB") or 4096)
         self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
@@ -245,6 +246,7 @@ class Service:
         to parallelise costs time, guessing wrong costs a failed build.
         """
         if (conf.get("LIGHT_LANE") or "auto").lower() in ("no", "0", "off"):
+            self.light_reason = "disabled by configuration"
             log("light lane disabled by configuration")
             return False
         path = conf.get("LICENSE") or "/etc/vivadocontainment/Xilinx.lic"
@@ -252,17 +254,22 @@ class Service:
             with open(path) as f:
                 text = f.read()
         except OSError:
+            self.light_reason = f"no licence file at {path} to read a seat count from"
             log(f"no licence at {path}: one job at a time")
             return False
         if "DUP_GROUP=UHD" in text.replace(" ", ""):
+            self.light_reason = "licence groups duplicate checkouts (DUP_GROUP=UHD)"
             log("licence groups duplicate checkouts (DUP_GROUP=UHD): "
                 "light lane enabled")
             return True
         counts = [int(m) for m in re.findall(r"^INCREMENT\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)",
                                             text, re.M)]
         if counts and min(counts) >= 2:
+            self.light_reason = f"licence allows {min(counts)} at once"
             log(f"licence allows {min(counts)} at once: light lane enabled")
             return True
+        self.light_reason = ("licence is single-seat, so a second Vivado "
+                             "would be refused a checkout")
         log("licence looks single-seat: one job at a time")
         return False
 
@@ -462,6 +469,21 @@ class Service:
             cancelled = set(self.cancelled)
         return sum(1 for j in self.queued_jobs() if j["id"] not in cancelled)
 
+    def lane_status(self):
+        """A lane that cannot be used must not read like one that is idle:
+        an agent asked for the light lane twice, was silently given the heavy
+        one, and had no way to tell that from bad luck."""
+        out = {}
+        for name, lane in self.lanes.items():
+            entry = {"enabled": name != "light" or self.light_ok,
+                     "queued": len(lane.queue.snapshot()),
+                     "running": lane.info()}
+            if name == "light":
+                entry["reason"] = self.light_reason
+                entry["max_seconds"] = self.light_cap
+            out[name] = entry
+        return out
+
     def running(self):
         """What is in each slot. Attributed, and with a start time: a bare
         job id sent one agent looking for the owner and it cancelled a
@@ -481,9 +503,7 @@ class Service:
             "persistent": self.persistent(),
             "busy": self.busy(),
             "running": self.running(),
-            "lanes": {name: {"queued": len(lane.queue.snapshot()),
-                             "running": lane.info()}
-                      for name, lane in self.lanes.items()},
+            "lanes": self.lane_status(),
             "queued": self.pending(),
             "root": self.root,
             "projects": self.projects(),
@@ -721,18 +741,20 @@ class Service:
             "id": job["id"], "op": op, "cmd": argv, "state": "queued",
             "cwd": job["cwd"], "queued": int(time.time()),
         })
-        # Announce before queueing: the worker thread is free to pick this up
-        # the instant it lands, and "running" overtaking "queued" confuses any
-        # client that trusts the last message it saw.
-        self.reply(project, req, {
-            "op": op, "job": job["id"], "state": "queued",
-            "log": f"{self.base}/project/{project}/job/{job['id']}/log",
-        }, final=False)
         lane = self.lane_for(op, body)
         if lane.name == "light" and (not job["timeout"]
                                      or job["timeout"] > self.light_cap):
             job["timeout"] = self.light_cap
         job["lane"] = lane.name
+        # Announce before queueing: the worker thread is free to pick this up
+        # the instant it lands, and "running" overtaking "queued" confuses any
+        # client that trusts the last message it saw. The lane goes in the
+        # reply because a weight that was not honoured is otherwise
+        # indistinguishable from one that was.
+        self.reply(project, req, {
+            "op": op, "job": job["id"], "state": "queued", "lane": lane.name,
+            "log": f"{self.base}/project/{project}/job/{job['id']}/log",
+        }, final=False)
         lane.queue.put(job)
         self.publish_status()
 
@@ -921,8 +943,8 @@ class Service:
             lane.op, lane.started = job["op"], int(time.time())
         self.publish_status()
         self.reply(project, req, {"op": job["op"], "job": job_id,
-                                  "state": "running", "log": logtopic},
-                   final=False)
+                                  "state": "running", "lane": lane.name,
+                                  "log": logtopic}, final=False)
         started = time.time()
         record = {"id": job_id, "op": job["op"], "cmd": job["cmd"],
                   "state": "running", "cwd": job["cwd"], "boot": self.boot,
@@ -986,6 +1008,7 @@ class Service:
         # rc's business, so a failing Vivado run is not a protocol error.
         result = {
             "op": job["op"], "job": job_id, "state": "done",
+            "lane": lane.name,
             "rc": rc, "seconds": round(time.time() - started, 1),
             "log": os.path.join(".vc", "jobs", job_id + ".log"),
             "tail": tail[-50:],

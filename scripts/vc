@@ -213,9 +213,15 @@ def do_vivado(s, args):
     if opts["timeout"] is None:
         print("vc: no --timeout, this job can hold the worker for ever",
               file=sys.stderr)
-    return report_job(s.request(
+    replies = s.request(
         "vivado", tcl=words[0], tclargs=tclargs, log=opts["log"],
-        journal=opts["journal"], cwd=opts["cwd"], timeout=opts["timeout"])[-1])
+        journal=opts["journal"], cwd=opts["cwd"], timeout=opts["timeout"],
+        weight="light" if args.light else None)
+    lane = next((r.get("lane") for r in replies if r.get("lane")), None)
+    if args.light and lane and lane != "light":
+        print(f"vc: asked for the light lane, got {lane} -- check "
+              f"lanes.light.reason in status", file=sys.stderr)
+    return report_job(replies[-1])
 
 
 def do_tool(s, args):
@@ -249,6 +255,10 @@ def main():
     p.add_argument("--password", default=os.environ.get("VC_PASS"))
     p.add_argument("--cwd", default="", help="working directory for run")
     p.add_argument("--timeout", type=float, help="job timeout in seconds")
+    p.add_argument("--light", action="store_true",
+                   help="ask for the light lane; the worker caps how long it "
+                        "may take, and falls back to heavy if the licence "
+                        "will not allow a second Vivado")
     p.add_argument("--wait", type=float, default=0,
                    help="give up on a reply after this many seconds")
     p.add_argument("-r", "--recursive", action="store_true")

@@ -229,7 +229,10 @@ Notes for the caller:
   the claim costs the caller rather than everyone else.
 * The light lane exists only if the licence permits two Vivado checkouts at
   once -- the worker reads that from the `.lic` at startup, and falls back to
-  one lane when it cannot tell. Heavy jobs also wait for free memory before
+  one lane when it cannot tell. `status` reports `lanes.light.enabled` and a
+  `reason` when it is off, and **every reply names the `lane` the job was
+  actually placed in**, so a `weight` that was not honoured is never confused
+  with one that was. Heavy jobs also wait for free memory before
   starting, since `/tmp` is a tmpfs competing for the same RAM.
 * The queue is **round-robin over projects**, FIFO within a project. Queueing
   ten builds does not push a neighbour's single build behind all ten: each
