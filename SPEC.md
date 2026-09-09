@@ -25,6 +25,16 @@ jobs run inside the VM, artifacts come back over MQTT.
 | `<base>/worker/<worker>/state` | worker -> all | `online` / `offline`, retained |
 | `<base>/worker/<worker>/status` | worker -> all | status object, retained |
 
+**A retained `status` is not proof of life.** It is whatever the worker last
+published, and the broker serves it long after the worker has gone. Judge
+liveness from two things in it: `time`, which the worker republishes on a
+timer (30 s by default) and which therefore stops advancing when it stops
+working, and `pending` against `handled` -- requests accepted but not yet
+answered, against requests answered. A `pending` that climbs while `handled`
+stands still is a worker taking requests and not servicing them. The retained
+`state` topic is the other half: the broker sets it to `offline` by will when
+the connection drops.
+
 Rules:
 
 * Publish requests with **QoS 1** and **retain = false**. A retained request

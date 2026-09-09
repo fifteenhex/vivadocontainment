@@ -18,6 +18,7 @@ reply topic and waits for final. See README.md for the full protocol.
 
 import base64
 import binascii
+import concurrent.futures
 import json
 import os
 import pwd
@@ -189,6 +190,11 @@ class Service:
         # it exists only if the licence permits two checkouts at once.
         self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
         self.light_reason = "unknown"
+        self.workers = int(conf.get("WORKERS") or 4)
+        self.heartbeat_secs = float(conf.get("HEARTBEAT_SECONDS") or 30)
+        self.accepted = 0        # requests taken off the wire
+        self.handled = 0         # requests answered
+        self.project_locks = {}
         self.heavy_mem_min = int(conf.get("HEAVY_MEM_MIN_MB") or 4096)
         self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
@@ -434,31 +440,54 @@ class Service:
                 return
             if body.get("worker") not in (None, self.worker):
                 return          # addressed to a different worker on this broker
-            op = body.get("op")
+            with self.lock:
+                self.accepted += 1
+            # Handlers run on a pool, not here. A slow one -- a big get, a
+            # disk that has stopped answering -- used to block this thread,
+            # which is also paho's network loop, so the worker stopped
+            # replying to everything while its retained status sat there
+            # looking healthy.
+            self.pool.submit(self.dispatch, project, req, body)
+        except Error as e:
+            self.reply(project, req, {"op": None, "ok": False, "error": str(e)})
+
+    def project_lock(self, project):
+        """One project's requests stay in order; different projects do not
+        wait on each other."""
+        with self.lock:
+            return self.project_locks.setdefault(project, threading.Lock())
+
+    def dispatch(self, project, req, body):
+        op = body.get("op")
+        try:
             for field, why in REFUSED.items():
                 if field in body:
                     raise Error(f"{field} is not accepted: {why}")
             handler = getattr(self, f"op_{op}", None) if op else None
             if handler is None:
                 raise Error(f"unknown op {op!r}")
-            handler(project, req, body)
+            with self.project_lock(project):
+                handler(project, req, body)
         except Error as e:
             self.reply(project, req, {"op": op, "ok": False, "error": str(e)})
-        except Exception as e:                          # never kill the loop
+        except Exception as e:                          # never kill a worker
             log(f"{project}/{op}: {e}")
             self.reply(project, req, {"op": op, "ok": False,
                                       "error": f"{type(e).__name__}: {e}"})
+        finally:
+            with self.lock:
+                self.handled += 1
 
     def publish(self, topic, payload, retain=False, qos=1):
         if not isinstance(payload, (str, bytes)):
             payload = json.dumps(payload)
-        self.client.publish(topic, payload, qos=qos, retain=retain)
+        return self.client.publish(topic, payload, qos=qos, retain=retain)
 
     def reply(self, project, req, body, final=True):
         body = dict(body, req=req, final=final, worker=self.worker,
                     boot=self.boot)
         body.setdefault("ok", True)
-        self.publish(f"{self.base}/project/{project}/reply/{req}", body)
+        return self.publish(f"{self.base}/project/{project}/reply/{req}", body)
 
     def queued_jobs(self):
         return [j for lane in self.lanes.values() for j in lane.queue.snapshot()]
@@ -501,6 +530,14 @@ class Service:
             "worker": self.worker,
             "boot": self.boot,
             "persistent": self.persistent(),
+            # Without a time, a retained status published hours ago reads
+            # exactly like one published now, and an agent cannot tell a busy
+            # worker from a dead one. handled/pending say whether requests are
+            # still being answered: pending climbing while handled stands
+            # still is a wedged dispatcher.
+            "time": int(time.time()),
+            "handled": self.handled,
+            "pending": max(0, self.accepted - self.handled),
             "busy": self.busy(),
             "running": self.running(),
             "lanes": self.lane_status(),
@@ -636,11 +673,17 @@ class Service:
         with open(full, "rb") as f:
             for index in range(count):
                 data = f.read(self.chunk)
-                self.reply(project, req, {
+                info = self.reply(project, req, {
                     "op": "get", "path": body.get("path"), "size": size,
                     "b64": base64.b64encode(data).decode(),
                     "chunk": {"index": index, "count": count},
                 }, final=(index == count - 1))
+                # Wait for each chunk to go out rather than queueing a
+                # hundred megabytes of base64 in memory and hoping.
+                try:
+                    info.wait_for_publish(timeout=60)
+                except (RuntimeError, ValueError):
+                    pass
 
     def op_rm(self, project, req, body):
         full = self.writable(project, as_str(body.get("path") or "", "path"))
@@ -1068,9 +1111,13 @@ class Service:
         if not os.path.ismount("/scratch") and self.root.startswith("/scratch"):
             log("warning: /scratch is not mounted, projects live in RAM and "
                 "die with the VM (make scratch)")
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.workers, thread_name_prefix="op")
         self.client.connect_async(host, int(self.conf.get("PORT") or 1883),
                                   keepalive=30)
         self.client.loop_start()
+        threading.Thread(target=self.heartbeat, name="heartbeat",
+                         daemon=True).start()
         workers = [threading.Thread(target=self.serve_lane, args=(lane,),
                                     name=f"lane-{name}", daemon=True)
                    for name, lane in self.lanes.items()]
@@ -1079,6 +1126,16 @@ class Service:
         for worker in workers:
             worker.join()
         return 0
+
+    def heartbeat(self):
+        """Republish the status on a timer so its timestamp keeps moving
+        while the worker is healthy -- and stops when it is not."""
+        while True:
+            time.sleep(self.heartbeat_secs)
+            try:
+                self.publish_status()
+            except Exception as e:
+                log(f"heartbeat: {e}")
 
     def serve_lane(self, lane):
         """One slot per lane: take a job, run it to completion, take the
