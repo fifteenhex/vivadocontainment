@@ -279,6 +279,11 @@ The simulation binaries, same shape, for the `xvlog` / `xelab` / `xsim` flow.
 
 Replies are identical to `vivado`, including the durable job record.
 
+`xelab` compiles generated C for the simulation kernel and looks for
+`/usr/bin/gcc` by that exact path. The retained status reports `compiler`:
+when it is null, `xvlog` will work and `xelab` and `xsim` will not, and there
+is nothing a client can do about it from here -- tell the operator.
+
 ### version
 
 ```json
@@ -345,9 +350,11 @@ job's own request then gets its final reply with a negative `rc`.
     "queued": 0, "queued_here": 0, "projects": ["demo", "second"]}
 ```
 
-The retained `<base>/worker/<worker>/status` carries the same worker-level
-fields plus `root` and `free` (bytes free on the project filesystem), so an
-agent can pick an idle worker without sending anything.
+The retained `<base>/worker/<worker>/status` and the `status` op carry the
+same worker-level fields -- they are built from one place, so they cannot
+drift -- and the op adds `exists`, `path` and `queued_here` for the project
+you asked from. The retained copy means an agent can size up a worker without
+sending anything.
 
 `queued` counts every waiting job on the worker, `queued_here` only this
 project's. With round-robin scheduling the second is what predicts your own

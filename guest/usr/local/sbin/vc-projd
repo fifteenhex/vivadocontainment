@@ -190,6 +190,7 @@ class Service:
         # it exists only if the licence permits two checkouts at once.
         self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
         self.light_reason = "unknown"
+        self.compiler = self.find_compiler()
         self.workers = int(conf.get("WORKERS") or 4)
         self.heartbeat_secs = float(conf.get("HEARTBEAT_SECONDS") or 30)
         self.accepted = 0        # requests taken off the wire
@@ -278,6 +279,16 @@ class Service:
                              "would be refused a checkout")
         log("licence looks single-seat: one job at a time")
         return False
+
+    def find_compiler(self):
+        """xelab reports "/usr/bin/gcc not found" and stops, so knowing
+        whether one is there is worth a line at startup rather than a failed
+        elaboration at the end of somebody's upload."""
+        for path in ("/usr/bin/gcc", "/usr/bin/cc"):
+            if os.path.exists(path):
+                return path
+        log("warning: no /usr/bin/gcc -- xelab cannot elaborate a simulation")
+        return None
 
     def memory_free_mb(self):
         try:
@@ -525,8 +536,12 @@ class Service:
         with self.lock:
             return any(lane.job for lane in self.lanes.values())
 
-    def publish_status(self):
-        self.publish(f"{self.me}/status", {
+    def status_body(self):
+        """The worker-level status, shared by the retained topic and the
+        status op: two hand-maintained copies drifted apart, and a client
+        reasonably expected the op to be the smaller of the two rather than
+        a different set."""
+        return {
             "worker": self.worker,
             "boot": self.boot,
             "persistent": self.persistent(),
@@ -545,7 +560,14 @@ class Service:
             "root": self.root,
             "projects": self.projects(),
             "free": shutil.disk_usage(self.root).free if os.path.isdir(self.root) else 0,
-        }, retain=True)
+            # xelab compiles generated C and looks for this exact path, so a
+            # worker without it can run xvlog and nothing else. Reported here
+            # rather than discovered at the far end of an upload.
+            "compiler": self.compiler,
+        }
+
+    def publish_status(self):
+        self.publish(f"{self.me}/status", self.status_body(), retain=True)
 
     # -- project ops -----------------------------------------------------
 
@@ -728,13 +750,11 @@ class Service:
     def op_status(self, project, req, body):
         path = self.project_dir(project)
         self.publish_status()
-        self.reply(project, req, {
-            "op": "status", "exists": os.path.isdir(path), "path": path,
-            "busy": self.busy(), "running": self.running(),
-            "queued": self.pending(), "projects": self.projects(),
-            "queued_here": sum(1 for j in self.queued_jobs()
-                               if j["project"] == project),
-        })
+        body = dict(self.status_body(), op="status",
+                    exists=os.path.isdir(path), path=path,
+                    queued_here=sum(1 for j in self.queued_jobs()
+                                    if j["project"] == project))
+        self.reply(project, req, body)
 
     # -- jobs ------------------------------------------------------------
 

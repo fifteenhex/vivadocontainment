@@ -110,6 +110,7 @@ PACKAGES        ?= linux-image-$(ARCH) initramfs-tools systemd-sysv udev \
                    openssh-server ca-certificates iproute2 iputils-ping \
                    e2fsprogs rsync curl unzip xz-utils file less procps \
                    psmisc python3 make xauth busybox \
+                   gcc g++ \
                    libtinfo6 libncurses6 libx11-6 libxext6 libxrender1 \
                    libxtst6 libxi6 libxft2 libfontconfig1 libfreetype6 \
                    libglib2.0-0 libsm6 libice6 libstdc++6 zlib1g \
