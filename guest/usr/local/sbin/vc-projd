@@ -38,6 +38,18 @@ VC_EXEC = "/usr/local/bin/vc-exec"
 # The only binaries an agent can ask for. Everything else -- shells, argv of
 # its own choosing, an environment to poison -- is deliberately unreachable.
 TOOLS = {"xvlog", "xelab", "xsim"}
+# xelab compiles with /usr/bin/gcc and LINKS with Vivado's own
+# tps/lnx64/gcc-*/bin/g++. Only the second one can fail the way it does,
+# so that is the one worth testing.
+PROBE_SCRIPT = """
+set -e
+gxx=$(ls -d "$XILINX_VIVADO"/tps/lnx64/gcc-*/bin/g++ 2>/dev/null | sort | tail -1)
+[ -n "$gxx" ] || gxx=$(command -v g++ 2>/dev/null || true)
+[ -n "$gxx" ] || { echo "no g++ anywhere"; exit 2; }
+echo "vc-linker: $gxx"
+printf 'int main(void){return 0;}\\n' > probe.cpp
+"$gxx" -o probe probe.cpp
+"""
 # A chunked upload cannot be more parts than this; a count of a million is a
 # typo, and it stages a partial that could never complete.
 MAX_CHUNKS = 10000
@@ -191,7 +203,7 @@ class Service:
         # it exists only if the licence permits two checkouts at once.
         self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
         self.light_reason = "unknown"
-        self.compiler = self.find_compiler(conf)
+        self.compiler = {"can_link": None, "reason": "not probed yet"}
         self.workers = int(conf.get("WORKERS") or 4)
         self.heartbeat_secs = float(conf.get("HEARTBEAT_SECONDS") or 30)
         self.accepted = 0        # requests taken off the wire
@@ -281,42 +293,70 @@ class Service:
         log("licence looks single-seat: one job at a time")
         return False
 
-    def find_compiler(self, conf):
-        """Compile and link a trivial program, and report what happened.
+    def probe_toolchain(self):
+        """Link a trivial program the way a job would, and report that.
 
-        Reporting the path because the binary exists is the same mistake as
-        a heartbeat that outlives its dispatcher: plausible and wrong. A gcc
-        without libc's startup objects compiles every module and then fails
-        at the link, by which point the client has stopped suspecting the
-        environment.
+        Twice now a check has certified something jobs never see: a path
+        because the binary was there, then /usr/bin/gcc because it is the
+        compiler xelab prints first. The one that fails is the linker --
+        Vivado's own g++ -- so the probe runs through vc-exec, with the
+        environment a job gets, as an unprivileged user, and links an
+        executable rather than compiling an object.
         """
-        candidates = [conf["CC"]] if conf.get("CC") else ["/usr/bin/gcc",
-                                                          "/usr/bin/cc"]
-        cc = next((p for p in candidates if os.path.exists(p)), None)
-        if not cc:
-            log("warning: no C compiler -- xelab cannot elaborate a simulation")
-            return {"cc": None, "can_link": False,
-                    "reason": "no compiler at " + " or ".join(candidates)}
+        cc = next((p for p in ("/usr/bin/gcc", "/usr/bin/cc")
+                   if os.path.exists(p)), None)
+        result = {"cc": cc, "link_cc": None, "can_link": False,
+                  "reason": None, "as_uid": None}
         tmp = tempfile.mkdtemp(prefix="vc-cc-")
         try:
-            src = os.path.join(tmp, "probe.c")
-            with open(src, "w") as f:
-                f.write("int main(void){return 0;}\n")
-            out = subprocess.run([cc, "-o", os.path.join(tmp, "probe"), src],
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, timeout=120)
+            creds = {}
+            if os.geteuid() == 0:
+                probe_uid = int(self.conf.get("PROBE_UID") or 65534)
+                try:
+                    os.chown(tmp, probe_uid, probe_uid)
+                    creds = {"user": probe_uid, "group": probe_uid,
+                             "extra_groups": []}
+                    result["as_uid"] = probe_uid
+                except OSError:
+                    pass
+            out = subprocess.run([VC_EXEC, "sh", "-c", PROBE_SCRIPT], cwd=tmp,
+                                 env=self.job_env(), stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, timeout=180,
+                                 **creds)
+            text = out.stdout.decode(errors="replace").strip()
+            for line in text.splitlines():
+                if line.startswith("vc-linker: "):
+                    result["link_cc"] = line.split(": ", 1)[1]
             if out.returncode == 0:
-                log(f"{cc} compiles and links")
-                return {"cc": cc, "can_link": True, "reason": None}
-            lines = out.stdout.decode(errors="replace").strip().splitlines()
-            reason = lines[0] if lines else f"exited {out.returncode}"
-            log(f"warning: {cc} cannot link: {reason}")
-            return {"cc": cc, "can_link": False, "reason": reason}
+                result["can_link"] = True
+                log(f"toolchain ok: {result['link_cc']} links")
+            else:
+                lines = [l for l in text.splitlines()
+                         if l and not l.startswith("vc-linker: ")]
+                result["reason"] = lines[0] if lines else f"exited {out.returncode}"
+                log(f"warning: {result['link_cc'] or 'no linker'} cannot link: "
+                    f"{result['reason']} -- xelab will fail")
         except (OSError, subprocess.SubprocessError) as e:
-            log(f"warning: cannot test {cc}: {e}")
-            return {"cc": cc, "can_link": False, "reason": str(e)}
+            result["reason"] = str(e)
+            log(f"warning: cannot test the toolchain: {e}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+        return result
+
+    def job_env(self):
+        """The environment a job runs in. No caller-supplied variables --
+        LD_PRELOAD alone would undo taking arbitrary commands away -- but
+        the worker does have to tell Vivado's bundled linker where Debian
+        keeps the C runtime: its gcc predates multiarch and does not look
+        in /usr/lib/x86_64-linux-gnu, which is why every elaboration failed
+        on crt1.o while /usr/bin/gcc was perfectly happy.
+        """
+        env = dict(os.environ)
+        multiarch = os.environ.get("VC_MULTIARCH", "/usr/lib/x86_64-linux-gnu")
+        if os.path.isdir(multiarch):
+            existing = env.get("LIBRARY_PATH")
+            env["LIBRARY_PATH"] = f"{multiarch}:{existing}" if existing else multiarch
+        return env
 
     def memory_free_mb(self):
         try:
@@ -1017,9 +1057,7 @@ class Service:
                                                      job_id + ".log"))
         os.makedirs(os.path.dirname(logpath), exist_ok=True)
 
-        # No caller-supplied environment: LD_PRELOAD alone would undo the
-        # point of taking arbitrary commands away.
-        env = dict(os.environ)
+        env = self.job_env()
         uid = self.project_uid(project)
         if uid is not None:
             home = self.resolve(project, os.path.join(".vc", "home"))
@@ -1153,6 +1191,7 @@ class Service:
             log("no BROKER configured, nothing to do")
             return 0
         os.makedirs(self.root, exist_ok=True)
+        self.compiler = self.probe_toolchain()
         self.reconcile()
         if self.run_as_user:
             # Root-owned and not writable by any job, so one project cannot

@@ -279,12 +279,17 @@ The simulation binaries, same shape, for the `xvlog` / `xelab` / `xsim` flow.
 
 Replies are identical to `vivado`, including the durable job record.
 
-`xelab` compiles generated C for the simulation kernel and links it, so the
-worker needs a working toolchain and not merely a `gcc` binary. At startup it
-compiles and links a trivial program and reports the outcome:
+`xelab` compiles generated C with `/usr/bin/gcc` and then **links with
+Vivado's own** `tps/lnx64/gcc-*/bin/g++`, which is the half that fails: that
+compiler predates multiarch and does not look in `/usr/lib/x86_64-linux-gnu`
+for the C runtime. The worker puts it on `LIBRARY_PATH` for every job, and at
+startup links a trivial program with that same linker, through the same spawn
+path a job uses:
 
 ```json
-"compiler": {"cc": "/usr/bin/gcc", "can_link": true, "reason": null}
+"compiler": {"cc": "/usr/bin/gcc",
+             "link_cc": "/tools/.../tps/lnx64/gcc-9.3.0/bin/g++",
+             "can_link": true, "reason": null, "as_uid": 65534}
 ```
 
 `can_link: false` means `xvlog` will work and `xelab` and `xsim` will not --
