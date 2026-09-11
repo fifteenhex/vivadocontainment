@@ -279,10 +279,17 @@ The simulation binaries, same shape, for the `xvlog` / `xelab` / `xsim` flow.
 
 Replies are identical to `vivado`, including the durable job record.
 
-`xelab` compiles generated C for the simulation kernel and looks for
-`/usr/bin/gcc` by that exact path. The retained status reports `compiler`:
-when it is null, `xvlog` will work and `xelab` and `xsim` will not, and there
-is nothing a client can do about it from here -- tell the operator.
+`xelab` compiles generated C for the simulation kernel and links it, so the
+worker needs a working toolchain and not merely a `gcc` binary. At startup it
+compiles and links a trivial program and reports the outcome:
+
+```json
+"compiler": {"cc": "/usr/bin/gcc", "can_link": true, "reason": null}
+```
+
+`can_link: false` means `xvlog` will work and `xelab` and `xsim` will not --
+`reason` carries the linker's first line. There is nothing a client can do
+about it from here, so tell the operator rather than retrying.
 
 ### version
 

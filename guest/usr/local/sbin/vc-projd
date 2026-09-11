@@ -27,6 +27,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -190,7 +191,7 @@ class Service:
         # it exists only if the licence permits two checkouts at once.
         self.light_cap = float(conf.get("LIGHT_MAX_SECONDS") or 300)
         self.light_reason = "unknown"
-        self.compiler = self.find_compiler()
+        self.compiler = self.find_compiler(conf)
         self.workers = int(conf.get("WORKERS") or 4)
         self.heartbeat_secs = float(conf.get("HEARTBEAT_SECONDS") or 30)
         self.accepted = 0        # requests taken off the wire
@@ -280,15 +281,42 @@ class Service:
         log("licence looks single-seat: one job at a time")
         return False
 
-    def find_compiler(self):
-        """xelab reports "/usr/bin/gcc not found" and stops, so knowing
-        whether one is there is worth a line at startup rather than a failed
-        elaboration at the end of somebody's upload."""
-        for path in ("/usr/bin/gcc", "/usr/bin/cc"):
-            if os.path.exists(path):
-                return path
-        log("warning: no /usr/bin/gcc -- xelab cannot elaborate a simulation")
-        return None
+    def find_compiler(self, conf):
+        """Compile and link a trivial program, and report what happened.
+
+        Reporting the path because the binary exists is the same mistake as
+        a heartbeat that outlives its dispatcher: plausible and wrong. A gcc
+        without libc's startup objects compiles every module and then fails
+        at the link, by which point the client has stopped suspecting the
+        environment.
+        """
+        candidates = [conf["CC"]] if conf.get("CC") else ["/usr/bin/gcc",
+                                                          "/usr/bin/cc"]
+        cc = next((p for p in candidates if os.path.exists(p)), None)
+        if not cc:
+            log("warning: no C compiler -- xelab cannot elaborate a simulation")
+            return {"cc": None, "can_link": False,
+                    "reason": "no compiler at " + " or ".join(candidates)}
+        tmp = tempfile.mkdtemp(prefix="vc-cc-")
+        try:
+            src = os.path.join(tmp, "probe.c")
+            with open(src, "w") as f:
+                f.write("int main(void){return 0;}\n")
+            out = subprocess.run([cc, "-o", os.path.join(tmp, "probe"), src],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, timeout=120)
+            if out.returncode == 0:
+                log(f"{cc} compiles and links")
+                return {"cc": cc, "can_link": True, "reason": None}
+            lines = out.stdout.decode(errors="replace").strip().splitlines()
+            reason = lines[0] if lines else f"exited {out.returncode}"
+            log(f"warning: {cc} cannot link: {reason}")
+            return {"cc": cc, "can_link": False, "reason": reason}
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"warning: cannot test {cc}: {e}")
+            return {"cc": cc, "can_link": False, "reason": str(e)}
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def memory_free_mb(self):
         try:
