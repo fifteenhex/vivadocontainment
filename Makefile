@@ -153,6 +153,12 @@ SSH_HOST        ?= 127.0.0.1
 # where projects live, so you want one.
 SCRATCH_IMG     ?= $(BUILD)/scratch.qcow2
 SCRATCH_SIZE    ?= 64G
+# Swap for the guest. Raw and fully allocated on purpose: it takes its space
+# once, at creation, and can never grow past it -- and swapping into a sparse
+# file on a host that later fills up means I/O errors in the middle of a
+# build, which is worse than having no swap at all.
+SWAP_IMG        ?= $(BUILD)/swap.img
+SWAP_SIZE       ?= 16G
 # Size of the tmpfs holding all writes to the root filesystem.
 OVERLAY_SIZE    ?= 50%
 PIDFILE         ?= $(BUILD)/qemu.pid
@@ -182,7 +188,10 @@ CMDLINE = root=/dev/vda boot=vivado overlay_size=$(OVERLAY_SIZE) \
 comma := ,
 space := $(subst ,, )
 
-SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=virtio$(comma)format=qcow2)
+# serial= gives each a stable /dev/disk/by-id name, so the guest does not
+# have to guess whether it is vdc or vdd today.
+SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=virtio$(comma)format=qcow2$(comma)serial=vcscratch)
+SWAP_ARG    = $(if $(wildcard $(SWAP_IMG)),-drive file=$(SWAP_IMG)$(comma)if=virtio$(comma)format=raw$(comma)serial=vcswap)
 # restrict=on drops everything not named here; hostfwd is the way in and
 # guestfwd the way out, and both are explicit rules that survive it.
 NET_ARGS = $(if $(NET_RESTRICT),$(comma)restrict=on)$(comma)hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22$(if $(MQTT_BROKER),$(comma)guestfwd=tcp:$(GUEST_BROKER):$(MQTT_PORT)-tcp:$(MQTT_BROKER):$(MQTT_PORT))
@@ -193,7 +202,7 @@ QEMU_ARGS = \
 	-kernel $(KERNEL) -initrd $(INITRD) -append "$(CMDLINE)" \
 	-drive file=$(ROOTFS_IMG),if=virtio,format=raw,readonly=on \
 	-drive file=$(VIVADO_IMG),if=virtio,format=raw,readonly=on \
-	$(SCRATCH_ARG) \
+	$(SCRATCH_ARG) $(SWAP_ARG) \
 	-netdev user,id=n0$(NET_ARGS) \
 	-device virtio-net-pci,netdev=n0$(MAC_ARG) \
 	-device virtio-rng-pci \
@@ -202,7 +211,7 @@ QEMU_ARGS = \
 # ----------------------------------------------------------------- rules ---
 
 .PHONY: all rootfs vivado run run-bg stop ssh vc watch license-mac sizes deps \
-        scratch check clean clean-all info
+        scratch swap check clean clean-all info
 
 all: rootfs vivado
 
@@ -309,7 +318,7 @@ $(ROOTFS_TAR): $(GUEST_SRC) $(BUILD)/guest.vars $(BUILD)/rootfs.vars \
 		--customize-hook='sync-in $(GUEST) /' \
 		--customize-hook='chroot "$$1" mkdir -p "$(VIVADO_MNT)" /scratch' \
 		--customize-hook='chroot "$$1" /usr/local/sbin/vc-fixups' \
-		--customize-hook='chroot "$$1" systemctl enable ssh systemd-networkd vc-scratch.service $(if $(MQTT_BROKER),vc-projd.service)' \
+		--customize-hook='chroot "$$1" systemctl enable ssh systemd-networkd vc-scratch.service vc-swap.service $(if $(MQTT_BROKER),vc-projd.service)' \
 		--customize-hook='chroot "$$1" update-initramfs -u -k all' \
 		$(SUITE) $@ $(MIRROR)
 
@@ -331,6 +340,16 @@ $(INITRD): $(KERNEL)
 	@test -f $@ || { rm -f $<; $(MAKE) --no-print-directory $<; }
 
 # --- running -----------------------------------------------------------
+
+# 16G of swap costs 16G of host disk the moment you make it, and nothing
+# after that.
+swap: | $(BUILD)
+	@test ! -f $(SWAP_IMG) || { echo "$(SWAP_IMG) exists; delete it by hand if you mean to resize it"; exit 1; }
+	@# preallocation=falloc for the same reason fallocate is tried first:
+	@# the space is taken now, not discovered missing mid-build.
+	fallocate -l $(SWAP_SIZE) $(SWAP_IMG) 2>/dev/null \
+		|| qemu-img create -f raw -o preallocation=falloc $(SWAP_IMG) $(SWAP_SIZE)
+	@ls -lh $(SWAP_IMG) | awk '{print "  " $$5 " allocated at " $$9}'
 
 scratch: | $(BUILD)
 	@test ! -f $(SCRATCH_IMG) || { echo "$(SCRATCH_IMG) exists -- it holds every project; delete it by hand if you really mean to"; exit 1; }

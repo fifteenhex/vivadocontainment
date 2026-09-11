@@ -44,6 +44,16 @@ There is no host filesystem share on purpose: the only way in or out is MQTT,
 so an agent needs nothing but a broker address. Run `make scratch` before
 first boot, or projects live in RAM and die with the VM.
 
+`make swap` adds a swap device, and is worth doing. Vivado's peak is far above
+its average, and without swap a spike hands the OOM killer a choice it gets
+wrong -- it has taken the worker itself, losing every project's job records
+along with the build that caused it. The file is raw and **fully allocated**:
+16G of host disk the moment you create it and never a byte more, because a
+sparse file on a host that later fills up means I/O errors in the middle of a
+build. The worker is also marked as poor prey for the OOM killer and each job
+as good prey, so when swap is not enough the build dies rather than the
+service.
+
 ## Using it
 
 On the machine that has Vivado:

@@ -1,0 +1,13 @@
+[Unit]
+Description=Enable the vivadocontainment swap device
+DefaultDependencies=no
+After=local-fs.target
+Before=multi-user.target vc-projd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vc-swap
+
+[Install]
+WantedBy=multi-user.target

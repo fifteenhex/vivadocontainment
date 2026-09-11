@@ -1,0 +1,21 @@
+#!/bin/sh
+# Turn on the swap device if one was attached.
+#
+# Vivado's peak is much higher than its average, and without swap a spike
+# takes the OOM killer to whatever the kernel likes least -- which has been
+# the worker itself, losing every other project's work along with the build
+# that caused it. Swap turns that into a slow build instead.
+set -e
+
+# By id, not by name: vdb/vdc/vdd depend on which images are attached, and
+# a swap device that turns out to be the project disk would be a bad day.
+dev=/dev/disk/by-id/virtio-vcswap
+[ -b "${dev}" ] || dev=/dev/vdd
+[ -b "${dev}" ] || exit 0
+
+if [ "$(blkid -o value -s TYPE "${dev}" 2>/dev/null)" != swap ]; then
+	echo "vc-swap: formatting ${dev}"
+	mkswap -L vcswap "${dev}" >/dev/null
+fi
+swapon "${dev}"
+swapon --show

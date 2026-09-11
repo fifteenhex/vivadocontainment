@@ -2,7 +2,10 @@
 # Mount the optional scratch disk at /scratch, formatting it the first time.
 # Without one, /scratch is just part of the root overlay (i.e. RAM).
 set -e
-dev=/dev/vdc
+# By id, not by name: which of vdb/vdc/vdd this is depends on how many
+# images are attached.
+dev=/dev/disk/by-id/virtio-vcscratch
+[ -b "${dev}" ] || dev=/dev/vdc
 
 [ -b "${dev}" ] || exit 0
 if ! blkid "${dev}" >/dev/null 2>&1; then

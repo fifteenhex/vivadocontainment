@@ -10,6 +10,10 @@ Restart=always
 RestartSec=5
 # Vivado wants a real home and plenty of file descriptors.
 Environment=HOME=/root
+# The worker holds every project's job records and is what clients talk to;
+# losing it to a build's memory spike loses everyone's work, not just that
+# build's. The build is the right thing to sacrifice.
+OOMScoreAdjust=-500
 Environment=LANG=en_US.UTF-8
 LimitNOFILE=65536
 

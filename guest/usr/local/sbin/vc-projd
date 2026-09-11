@@ -1013,6 +1013,14 @@ class Service:
                     start_new_session=True, **creds)
                 with self.lock:
                     lane.proc = proc
+                # Make the kernel prefer this over the worker, sshd, or a
+                # neighbour's job when memory runs out. Swap makes a spike
+                # slow; this decides who dies when swap is not enough.
+                try:
+                    with open(f"/proc/{proc.pid}/oom_score_adj", "w") as f:
+                        f.write("500")
+                except OSError:
+                    pass
                 # A silent Vivado run still has to hit its timeout, so kill it
                 # from a timer rather than from the output loop.
                 timer = None
