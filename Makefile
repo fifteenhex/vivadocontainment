@@ -194,6 +194,12 @@ space := $(subst ,, )
 # rather than the drive: -drive serial= was deprecated in qemu 2.10 and is
 # gone, and the error it gives ("format 'qcow2' does not support the option
 # 'serial'") points at the format rather than the spelling.
+# Every disk is attached the same way, in this order, because mixing
+# if=virtio with explicit devices reorders them: qemu creates the explicit
+# ones first, /dev/vda stopped being the rootfs, and the initramfs tried to
+# mount the scratch disk as squashfs.
+ROOTFS_ARG  = -drive file=$(ROOTFS_IMG)$(comma)if=none$(comma)id=rootdrv$(comma)format=raw$(comma)readonly=on -device virtio-blk-pci$(comma)drive=rootdrv$(comma)serial=vcroot
+VIVADO_ARG  = -drive file=$(VIVADO_IMG)$(comma)if=none$(comma)id=vivadodrv$(comma)format=raw$(comma)readonly=on -device virtio-blk-pci$(comma)drive=vivadodrv$(comma)serial=vcvivado
 SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=none$(comma)id=scratchdrv$(comma)format=qcow2 -device virtio-blk-pci$(comma)drive=scratchdrv$(comma)serial=vcscratch)
 SWAP_ARG    = $(if $(wildcard $(SWAP_IMG)),-drive file=$(SWAP_IMG)$(comma)if=none$(comma)id=swapdrv$(comma)format=raw -device virtio-blk-pci$(comma)drive=swapdrv$(comma)serial=vcswap)
 # restrict=on drops everything not named here; hostfwd is the way in and
@@ -204,9 +210,7 @@ MAC_ARG     = $(if $(GUEST_MAC),$(comma)mac=$(GUEST_MAC))
 QEMU_ARGS = \
 	-machine q35,accel=$(ACCEL) -cpu $(CPU) -smp $(SMP) -m $(MEM) \
 	-kernel $(KERNEL) -initrd $(INITRD) -append "$(CMDLINE)" \
-	-drive file=$(ROOTFS_IMG),if=virtio,format=raw,readonly=on \
-	-drive file=$(VIVADO_IMG),if=virtio,format=raw,readonly=on \
-	$(SCRATCH_ARG) $(SWAP_ARG) \
+	$(ROOTFS_ARG) $(VIVADO_ARG) $(SCRATCH_ARG) $(SWAP_ARG) \
 	-netdev user,id=n0$(NET_ARGS) \
 	-device virtio-net-pci,netdev=n0$(MAC_ARG) \
 	-device virtio-rng-pci \

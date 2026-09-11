@@ -50,9 +50,15 @@ mountroot()
 		|| panic "vivadocontainment: cannot mount overlay tmpfs (size=${size})"
 	mkdir -p /run/rootfs/lower /run/rootfs/upper /run/rootfs/work
 
+	# vd* letters depend on how many images are attached and in what order,
+	# so fall back to the disk's own id before giving up.
+	byid=/dev/disk/by-id/virtio-vcroot
 	mount -t squashfs -o ro "${ROOT}" /run/rootfs/lower \
 		|| mount -t erofs -o ro "${ROOT}" /run/rootfs/lower \
-		|| panic "vivadocontainment: ${ROOT} mounts as neither squashfs nor erofs"
+		|| { [ -b "${byid}" ] && { echo "vivadocontainment: ${ROOT} is not the root; trying ${byid}"; \
+			mount -t squashfs -o ro "${byid}" /run/rootfs/lower \
+			|| mount -t erofs -o ro "${byid}" /run/rootfs/lower; }; } \
+		|| panic "vivadocontainment: no root filesystem on ${ROOT} or ${byid}"
 
 	# Options first: klibc's mount is "mount [-o opts] [-t type] dev dir"
 	# and rejects anything after the device, which is where this went wrong.
