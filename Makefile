@@ -190,9 +190,12 @@ comma := ,
 space := $(subst ,, )
 
 # serial= gives each a stable /dev/disk/by-id name, so the guest does not
-# have to guess whether it is vdc or vdd today.
-SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=virtio$(comma)format=qcow2$(comma)serial=vcscratch)
-SWAP_ARG    = $(if $(wildcard $(SWAP_IMG)),-drive file=$(SWAP_IMG)$(comma)if=virtio$(comma)format=raw$(comma)serial=vcswap)
+# have to guess whether it is vdc or vdd today. It has to go on the device
+# rather than the drive: -drive serial= was deprecated in qemu 2.10 and is
+# gone, and the error it gives ("format 'qcow2' does not support the option
+# 'serial'") points at the format rather than the spelling.
+SCRATCH_ARG = $(if $(wildcard $(SCRATCH_IMG)),-drive file=$(SCRATCH_IMG)$(comma)if=none$(comma)id=scratchdrv$(comma)format=qcow2 -device virtio-blk-pci$(comma)drive=scratchdrv$(comma)serial=vcscratch)
+SWAP_ARG    = $(if $(wildcard $(SWAP_IMG)),-drive file=$(SWAP_IMG)$(comma)if=none$(comma)id=swapdrv$(comma)format=raw -device virtio-blk-pci$(comma)drive=swapdrv$(comma)serial=vcswap)
 # restrict=on drops everything not named here; hostfwd is the way in and
 # guestfwd the way out, and both are explicit rules that survive it.
 NET_ARGS = $(if $(NET_RESTRICT),$(comma)restrict=on)$(comma)hostfwd=tcp:$(SSH_HOST):$(SSH_PORT)-:22$(if $(MQTT_BROKER),$(comma)guestfwd=tcp:$(GUEST_BROKER):$(MQTT_PORT)-tcp:$(MQTT_BROKER):$(MQTT_PORT))
