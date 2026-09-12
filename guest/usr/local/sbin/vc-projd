@@ -214,6 +214,8 @@ class Service:
         self.job_mem_max = conf.get("JOB_MEM_MAX") or "60%"
         self.job_slice = conf.get("JOB_SLICE") or "vc-jobs.slice"
         self.job_history = int(conf.get("JOB_HISTORY") or 200)
+        # How many waiting jobs the status names before it just counts them.
+        self.queue_listed = int(conf.get("QUEUE_LISTED") or 20)
         self.incoming_max_age = float(conf.get("INCOMING_MAX_AGE") or 86400)
         self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
@@ -586,10 +588,22 @@ class Service:
         """A lane that cannot be used must not read like one that is idle:
         an agent asked for the light lane twice, was silently given the heavy
         one, and had no way to tell that from bad luck."""
+        with self.lock:
+            cancelled = set(self.cancelled)
         out = {}
         for name, lane in self.lanes.items():
+            waiting = [j for j in lane.queue.snapshot()
+                       if j["id"] not in cancelled]
+            # Named, not just counted: "queued 4" tells an agent nothing about
+            # whether any of them are its own, or how long the one in front
+            # has been waiting.
+            listed = [{"job": j["id"], "project": j["project"], "op": j["op"],
+                       "weight": j.get("weight"), "queued": j.get("queued")}
+                      for j in waiting[:self.queue_listed]]
             entry = {"enabled": name != "light" or self.light_ok,
-                     "queued": len(lane.queue.snapshot()),
+                     "queued": len(waiting),
+                     "jobs": listed,
+                     "more": max(0, len(waiting) - len(listed)),
                      "running": lane.info()}
             if name == "light":
                 entry["reason"] = self.light_reason

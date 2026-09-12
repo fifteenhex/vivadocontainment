@@ -386,8 +386,11 @@ sending anything.
 project's. With round-robin scheduling the second is what predicts your own
 wait.
 
-`running` lists what is in each lane, and `lanes` gives the per-lane queue
-depth. Each entry names the job, **the project that owns it**, its lane, and
+`running` lists what is in each lane. `lanes` gives each lane's queue depth
+and names the jobs waiting in it -- `jobs` carries `job`, `project`, `op`,
+`weight` and the time each was queued, up to `QUEUE_LISTED` of them with the
+remainder counted in `more` -- so an agent can see where its own work sits in
+the line rather than only how long the line is. Each entry names the job, **the project that owns it**, its lane, and
 when it started. The owner is there so that a busy worker
 does not read as a stuck one: a job of someone else's, running for twenty
 minutes, is a synthesis, not a fault. You cannot cancel it, and you should

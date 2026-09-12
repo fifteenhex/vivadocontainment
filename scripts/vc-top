@@ -145,7 +145,21 @@ class Model:
                                 f"{info.get('reason', '')}", "dim"))
                 else:
                     out.append((f"  {lane:<6} {'idle':<8}", "dim"))
-                if info.get("queued"):
+                now = s.get("time")
+                for job in info.get("jobs") or []:
+                    waited = None
+                    if now and job.get("queued"):
+                        waited = now - job["queued"]
+                    light = " light" if job.get("weight") == "light" else ""
+                    out.append((f"  {'':<6} {'queued':<8} "
+                                f"{job.get('project', '?'):<22} "
+                                f"{job.get('op', '?'):<7} "
+                                f"{human_time(waited):>8}  "
+                                f"{job.get('job', '')}{light}", "dim"))
+                if info.get("more"):
+                    out.append((f"  {'':<6} {'':<8} and {info['more']} more",
+                                "dim"))
+                elif info.get("queued") and not info.get("jobs"):
                     out.append((f"  {'':<6} queued {info['queued']}", "dim"))
 
             projects = s.get("projects") or []
