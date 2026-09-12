@@ -3,4 +3,7 @@
 # By id rather than /dev/vdb: the letters depend on how many images are
 # attached, and this one must not end up pointing at the scratch disk.
 /dev/disk/by-id/virtio-vcvivado	@VIVADO_MNT@	erofs	ro,nofail	0 0
-tmpfs		/tmp		tmpfs		rw,nosuid,nodev,size=50%	0 0
+# Not a fraction of RAM: /tmp is memory, and a build that writes its
+# intermediates here is spending what synthesis needs. Jobs get TMPDIR on the
+# scratch disk instead, so this only has to cover odds and ends.
+tmpfs		/tmp		tmpfs		rw,nosuid,nodev,size=@TMP_SIZE@	0 0

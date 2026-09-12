@@ -227,6 +227,16 @@ Notes for the caller:
 * `rc` is Vivado's exit status. A process killed by a signal reports a
   negative `rc`; on expiry it also carries `"error": "timeout"`, which is what
   distinguishes a timeout from a `cancel`.
+* Each job runs with a **memory cap** (`JOB_MEM_MAX`, 60% of RAM by
+  default), with both lanes together capped below the machine's total. A
+  build that exceeds it is killed by the kernel inside its own cgroup: the
+  worker keeps answering, the other project's job keeps running, and you get
+  an `rc` and a `peak_mb` in the final reply rather than a worker gone quiet.
+  `peak_mb` is the high-water mark of the job and everything it spawned, so
+  it is what to size the next request against.
+* Jobs get `TMPDIR` inside the project, on the persistent disk. `/tmp` in the
+  guest is a small tmpfs -- memory -- so writing intermediates there competes
+  with synthesis for exactly what it is short of.
 * Work runs in two lanes. The **heavy** lane runs one Vivado at a time --
   synthesis is the thing that must not be doubled up. The **light** lane runs
   beside it for small work, so asking a five-second question does not mean

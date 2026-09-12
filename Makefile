@@ -160,8 +160,13 @@ SCRATCH_SIZE    ?= 64G
 # build, which is worse than having no swap at all.
 SWAP_IMG        ?= $(BUILD)/swap.img
 SWAP_SIZE       ?= 16G
-# Size of the tmpfs holding all writes to the root filesystem.
-OVERLAY_SIZE    ?= 50%
+# Size of the tmpfs holding all writes to the root filesystem. Both of these
+# are RAM: the overlay holds writes outside /scratch, and /tmp is where tools
+# scatter intermediates unless told otherwise. Jobs are given TMPDIR on the
+# scratch disk, so neither needs to be large, and neither should be -- every
+# gigabyte here is a gigabyte synthesis cannot have.
+OVERLAY_SIZE    ?= 25%
+TMP_SIZE        ?= 4G
 PIDFILE         ?= $(BUILD)/qemu.pid
 
 QEMU            ?= qemu-system-x86_64
@@ -253,6 +258,7 @@ $(GUEST): $(GUEST_SRC) Makefile $(wildcard config.mk) $(LICENSE_FILE) | $(BUILD)
 	cp -a guest $@.tmp
 	sed -i 's|@VIVADO_MNT@|$(VIVADO_MNT)|g; s|@LICENSE@|$(LICENSE_SPEC)|g' \
 		$@.tmp/etc/fstab $@.tmp/etc/profile.d/vivado.sh
+	sed -i 's|@TMP_SIZE@|$(TMP_SIZE)|' $@.tmp/etc/fstab
 	@# the guest always dials the mapped address; qemu decides where it lands
 	sed -i -e 's|@BROKER@|$(GUEST_BROKER)|' -e 's|@PORT@|$(MQTT_PORT)|' \
 		-e 's|@TOPIC@|$(MQTT_TOPIC)|' -e 's|@WORKER@|$(MQTT_WORKER)|' \

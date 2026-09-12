@@ -1,0 +1,11 @@
+[Unit]
+Description=vivadocontainment jobs
+Before=slices.target
+
+[Slice]
+# Each job is capped on its own, but two lanes can run at once and the sum
+# has to leave the guest something to live on: the worker, sshd and the
+# kernel's own caches. This is the backstop that keeps the machine answering
+# when both lanes are heavy.
+MemoryMax=85%
+MemorySwapMax=infinity

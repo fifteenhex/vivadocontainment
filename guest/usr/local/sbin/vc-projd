@@ -210,6 +210,9 @@ class Service:
         self.handled = 0         # requests answered
         self.project_locks = {}
         self.heavy_mem_min = int(conf.get("HEAVY_MEM_MIN_MB") or 4096)
+        # systemd takes a percentage of physical memory or a size.
+        self.job_mem_max = conf.get("JOB_MEM_MAX") or "60%"
+        self.job_slice = conf.get("JOB_SLICE") or "vc-jobs.slice"
         self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
         # reaches them, since a queue cannot be reached into.
@@ -1048,6 +1051,54 @@ class Service:
             json.dump(record, f, indent=1)
         os.replace(tmp, path)          # readers must never see a half record
 
+    def job_argv(self, job, uid):
+        """Wrap the job in a memory-capped scope where one is available.
+
+        A synthesis that runs away takes the machine with it: the OOM killer
+        picks something, the worker stops answering MQTT, and every agent
+        talking to it is left guessing. Inside a scope the kernel kills only
+        that job, everything else keeps running, and the client gets an rc
+        rather than silence. systemd-run has to do the privilege drop too --
+        an unprivileged process cannot register a transient unit -- so
+        setpriv goes inside the scope rather than Popen doing it.
+        """
+        inner = [VC_EXEC] + job["cmd"]
+        if uid is None or not shutil.which("systemd-run"):
+            creds = {} if uid is None else {
+                "user": uid, "group": uid, "extra_groups": []}
+            if uid is not None and not shutil.which("systemd-run"):
+                log("warning: no systemd-run, so this job runs without a "
+                    "memory cap")
+            return inner, creds
+        return ([
+            "systemd-run", "--scope", "--quiet", "--collect",
+            f"--unit=vcjob-{job['id']}", f"--slice={self.job_slice}",
+            "-p", f"MemoryMax={self.job_mem_max}",
+            "-p", "MemorySwapMax=infinity",
+            "--", "setpriv", f"--reuid={uid}", f"--regid={uid}",
+            "--clear-groups", "--",
+        ] + inner, {})
+
+    def job_peak_mb(self, job_id, pid):
+        """Peak memory of the job and everything it spawned. From the
+        scope's cgroup when there is one, since Vivado's children are where
+        the memory actually goes."""
+        path = (f"/sys/fs/cgroup/{self.job_slice}/vcjob-{job_id}.scope/"
+                "memory.peak")
+        try:
+            with open(path) as f:
+                return int(f.read().strip()) // (1024 * 1024)
+        except (OSError, ValueError):
+            pass
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
     def run_job(self, lane, job):
         project, job_id, req = job["project"], job["id"], job["req"]
         logtopic = f"{self.base}/project/{project}/job/{job_id}/log"
@@ -1058,12 +1109,21 @@ class Service:
         os.makedirs(os.path.dirname(logpath), exist_ok=True)
 
         env = self.job_env()
+        # /tmp is a tmpfs, so a build writing its intermediates there is
+        # spending the same memory it needs for synthesis. Vivado, xelab and
+        # the linker all honour TMPDIR, so point it at the project's own
+        # space on the scratch disk.
+        tmpdir = self.resolve(project, os.path.join(".vc", "tmp"))
+        os.makedirs(tmpdir, exist_ok=True)
+        env["TMPDIR"] = env["TMP"] = env["TEMP"] = tmpdir
+
         uid = self.project_uid(project)
         if uid is not None:
             home = self.resolve(project, os.path.join(".vc", "home"))
             os.makedirs(home, exist_ok=True)
             self.own(project, home)
             self.own(project, workdir)
+            self.own(project, tmpdir)
             env["HOME"] = home
             env["USER"] = env["LOGNAME"] = f"vcp{uid}"
 
@@ -1084,16 +1144,13 @@ class Service:
         log(f"{project}/{job_id}: {' '.join(job['cmd'])}")
 
         tail, rc, error = [], -1, None
+        peak = [None]
         try:
             with open(logpath, "wb") as logfile:
                 # vc-exec sources settings64.sh before exec'ing the command.
-                # user/group rather than preexec_fn: this process has three
-                # threads, and running Python between fork and exec is how
-                # you deadlock a daemon.
-                creds = {} if uid is None else {
-                    "user": uid, "group": uid, "extra_groups": []}
+                argv, creds = self.job_argv(job, uid)
                 proc = subprocess.Popen(
-                    [VC_EXEC] + job["cmd"], cwd=workdir,
+                    argv, cwd=workdir,
                     env=env, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     start_new_session=True, **creds)
@@ -1114,6 +1171,15 @@ class Service:
                     timer = threading.Timer(float(job["timeout"]),
                                             lambda: self.stop_proc(lane))
                     timer.start()
+                def watch_memory():
+                    while proc.poll() is None:
+                        seen = self.job_peak_mb(job_id, proc.pid)
+                        if seen is not None:
+                            peak[0] = max(peak[0] or 0, seen)
+                        time.sleep(5)
+
+                watcher = threading.Thread(target=watch_memory, daemon=True)
+                watcher.start()
                 for raw in proc.stdout:
                     logfile.write(raw)
                     logfile.flush()
@@ -1145,7 +1211,7 @@ class Service:
         # rc's business, so a failing Vivado run is not a protocol error.
         result = {
             "op": job["op"], "job": job_id, "state": "done",
-            "lane": lane.name,
+            "lane": lane.name, "peak_mb": peak[0],
             "rc": rc, "seconds": round(time.time() - started, 1),
             "log": os.path.join(".vc", "jobs", job_id + ".log"),
             "tail": tail[-50:],
