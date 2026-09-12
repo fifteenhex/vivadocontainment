@@ -44,6 +44,20 @@ There is no host filesystem share on purpose: the only way in or out is MQTT,
 so an agent needs nothing but a broker address. Run `make scratch` before
 first boot, or projects live in RAM and die with the VM.
 
+Memory is what breaks this VM, so it is bounded in four places: the root
+overlay and `/tmp` are small (25% and 4G, not half of RAM each); every job
+runs in a systemd scope capped at `JOB_MEM_MAX` with both lanes under a slice
+cap, so a runaway build is killed inside its own cgroup and the worker keeps
+answering; jobs write their intermediates to `TMPDIR` on the scratch disk
+rather than into RAM; and the journal is capped at 128M rather than systemd's
+default tenth of memory.
+
+Nothing accumulates, either: a job's temp directory goes when it ends, job
+records and logs are trimmed to the last 200 per project, and abandoned
+chunked uploads expire after a day. The same sweep runs at startup and
+hourly, so a worker that runs for weeks does not carry the leavings of every
+build it has ever run.
+
 `make swap` adds a swap device, and is worth doing. Vivado's peak is far above
 its average, and without swap a spike hands the OOM killer a choice it gets
 wrong -- it has taken the worker itself, losing every project's job records

@@ -234,9 +234,13 @@ Notes for the caller:
   an `rc` and a `peak_mb` in the final reply rather than a worker gone quiet.
   `peak_mb` is the high-water mark of the job and everything it spawned, so
   it is what to size the next request against.
-* Jobs get `TMPDIR` inside the project, on the persistent disk. `/tmp` in the
-  guest is a small tmpfs -- memory -- so writing intermediates there competes
-  with synthesis for exactly what it is short of.
+* Jobs get `TMPDIR` inside the project, on the persistent disk, and it is
+  **removed when the job ends**. `/tmp` in the guest is a small tmpfs --
+  memory -- so writing intermediates there competes with synthesis for
+  exactly what it is short of.
+* Job records and their logs are kept to the most recent `JOB_HISTORY` (200
+  by default) per project, oldest dropped. `jobs` therefore stays a bounded
+  reply; if you need a log for longer than that, `get` it.
 * Work runs in two lanes. The **heavy** lane runs one Vivado at a time --
   synthesis is the thing that must not be doubled up. The **light** lane runs
   beside it for small work, so asking a five-second question does not mean

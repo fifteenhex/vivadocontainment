@@ -213,6 +213,8 @@ class Service:
         # systemd takes a percentage of physical memory or a size.
         self.job_mem_max = conf.get("JOB_MEM_MAX") or "60%"
         self.job_slice = conf.get("JOB_SLICE") or "vc-jobs.slice"
+        self.job_history = int(conf.get("JOB_HISTORY") or 200)
+        self.incoming_max_age = float(conf.get("INCOMING_MAX_AGE") or 86400)
         self.light_ok = self.licence_allows_two(conf)
         # Ids cancelled before they started: the worker drops them when it
         # reaches them, since a queue cannot be reached into.
@@ -1113,7 +1115,10 @@ class Service:
         # spending the same memory it needs for synthesis. Vivado, xelab and
         # the linker all honour TMPDIR, so point it at the project's own
         # space on the scratch disk.
-        tmpdir = self.resolve(project, os.path.join(".vc", "tmp"))
+        # Per job, not per project: both lanes can be running jobs for the
+        # same project, and clearing one job's temp files out from under
+        # another would be its own kind of bug.
+        tmpdir = self.resolve(project, os.path.join(".vc", "tmp", job_id))
         os.makedirs(tmpdir, exist_ok=True)
         env["TMPDIR"] = env["TMP"] = env["TEMP"] = tmpdir
 
@@ -1221,6 +1226,7 @@ class Service:
         record.update({k: v for k, v in result.items() if k != "tail"})
         record["ended"] = int(time.time())
         self.write_record(project, job_id, record)
+        self.sweep(project, tmpdir)
         self.reply(project, req, result)
         log(f"{project}/{job_id}: rc={rc} in {result['seconds']}s")
         with self.lock:
@@ -1228,6 +1234,62 @@ class Service:
         self.publish_status()
 
     # -- main loop -------------------------------------------------------
+
+    def sweep(self, project, tmpdir=None):
+        """Clear up after a job.
+
+        Vivado leaves a great deal behind, and none of it was being removed:
+        a worker that never reboots accumulated every build's temp files,
+        every abandoned upload and every job log it had ever written. The
+        job's own temp directory goes immediately; records and logs are kept
+        to a recent window because agents read them; abandoned chunk uploads
+        expire, since the client that would have finished them is gone.
+        """
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        jobdir = os.path.join(self.project_dir(project), ".vc", "jobs")
+        try:
+            records = sorted(
+                (f for f in os.listdir(jobdir) if f.endswith(".json")),
+                key=lambda f: os.path.getmtime(os.path.join(jobdir, f)))
+        except OSError:
+            records = []
+        for name in records[:-self.job_history] if self.job_history else []:
+            base = name[:-len(".json")]
+            for path in (os.path.join(jobdir, name),
+                         os.path.join(jobdir, base + ".log")):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+        incoming = os.path.join(self.project_dir(project), ".vc", "incoming")
+        cutoff = time.time() - self.incoming_max_age
+        try:
+            stale = [d for d in os.listdir(incoming)
+                     if os.path.getmtime(os.path.join(incoming, d)) < cutoff]
+        except OSError:
+            stale = []
+        for name in stale:
+            log(f"{project}: dropping abandoned upload {name}")
+            shutil.rmtree(os.path.join(incoming, name), ignore_errors=True)
+
+    def sweep_all(self):
+        """Same, for every project, at startup and on a timer: a project
+        whose last job failed hard would otherwise keep its leavings for the
+        life of the worker."""
+        for project in self.projects():
+            try:
+                tmproot = os.path.join(self.project_dir(project), ".vc", "tmp")
+                for name in os.listdir(tmproot) if os.path.isdir(tmproot) else []:
+                    path = os.path.join(tmproot, name)
+                    busy = any(lane.job == name for lane in self.lanes.values())
+                    if not busy:
+                        shutil.rmtree(path, ignore_errors=True)
+                self.sweep(project)
+            except (OSError, Error) as e:
+                log(f"{project}: sweep failed: {e}")
 
     def reconcile(self):
         """Restart=always means a crash mid-build leaves a record claiming
@@ -1259,6 +1321,7 @@ class Service:
         os.makedirs(self.root, exist_ok=True)
         self.compiler = self.probe_toolchain()
         self.reconcile()
+        self.sweep_all()
         if self.run_as_user:
             # Root-owned and not writable by any job, so one project cannot
             # rename or delete another.
@@ -1291,10 +1354,14 @@ class Service:
     def heartbeat(self):
         """Republish the status on a timer so its timestamp keeps moving
         while the worker is healthy -- and stops when it is not."""
+        last_sweep = time.time()
         while True:
             time.sleep(self.heartbeat_secs)
             try:
                 self.publish_status()
+                if time.time() - last_sweep > 3600:
+                    last_sweep = time.time()
+                    self.sweep_all()
             except Exception as e:
                 log(f"heartbeat: {e}")
 
