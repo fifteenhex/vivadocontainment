@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+"""A live view of what a vivadocontainment worker is doing.
+
+    vc-top --broker bighost
+
+Reads the retained worker status, the reply traffic and the job logs, and
+draws what is running, what is queued and what just finished. It only
+listens: it never publishes, so it cannot disturb the agents using the
+worker.
+
+--once prints a single frame as plain text, which is easier to paste into a
+bug report than a screenshot.
+"""
+
+import argparse
+import curses
+import json
+import sys
+import time
+
+import paho.mqtt.client as mqtt
+
+RECENT = 12
+
+
+def human_size(n):
+    if not n:
+        return "-"
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def human_time(seconds):
+    if seconds is None:
+        return "-"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+class Worker:
+    """Everything known about one worker, from its retained topics."""
+
+    def __init__(self, name):
+        self.name = name
+        self.state = "?"
+        self.status = {}
+        self.seen = 0
+
+    @property
+    def stale(self):
+        """Seconds since the worker last said anything about itself. Its own
+        clock, not ours: a worker that has stopped republishing has stopped
+        working, whatever the retained message still says."""
+        published = self.status.get("time")
+        if not published:
+            return None
+        return max(0, int(time.time()) - published)
+
+
+class Model:
+    def __init__(self):
+        self.workers = {}
+        self.recent = []
+        self.logs = {}          # job id -> last line seen
+
+    def worker(self, name):
+        return self.workers.setdefault(name, Worker(name))
+
+    def on_message(self, topic, payload):
+        parts = topic.split("/")
+        if len(parts) >= 4 and parts[1] == "worker":
+            w = self.worker(parts[2])
+            w.seen = time.time()
+            if parts[3] == "state":
+                w.state = payload.decode(errors="replace").strip()
+            elif parts[3] == "status":
+                try:
+                    w.status = json.loads(payload)
+                except ValueError:
+                    pass
+            return
+        if len(parts) >= 3 and parts[1] == "project":
+            project = parts[2]
+            if topic.endswith("/log"):
+                self.logs[parts[4]] = payload.decode(errors="replace").rstrip()
+                return
+            if "/reply/" not in topic:
+                return
+            try:
+                reply = json.loads(payload)
+            except ValueError:
+                return
+            if reply.get("state") == "done" or reply.get("ok") is False:
+                self.recent.insert(0, (time.strftime("%H:%M:%S"), project, reply))
+                del self.recent[RECENT:]
+
+    def frame(self, width):
+        """The whole display as a list of (text, attribute-name) lines."""
+        out = []
+        if not self.workers:
+            return [("waiting for a worker to say something...", "dim")]
+        for name in sorted(self.workers):
+            w = self.workers[name]
+            s = w.status
+            stale = w.stale
+            health = "online" if w.state == "online" else w.state
+            bits = [f"{name:<10}", f"{health:<8}"]
+            if s.get("boot"):
+                bits.append(f"boot {s['boot'][:8]}")
+            bits.append(f"status {human_time(stale)} ago" if stale is not None
+                        else "status ?")
+            bits.append(f"free {human_size(s.get('free'))}")
+            cc = s.get("compiler") or {}
+            if isinstance(cc, dict):
+                bits.append("gcc ok" if cc.get("can_link") else "gcc BROKEN")
+            if s.get("pending"):
+                bits.append(f"pending {s['pending']}")
+            level = "bad" if (stale is None or stale > 120 or
+                              w.state != "online") else "good"
+            out.append((" ".join(bits), level))
+
+            for lane, info in sorted((s.get("lanes") or {}).items()):
+                running = info.get("running")
+                if running:
+                    elapsed = None
+                    if s.get("time") and running.get("started"):
+                        elapsed = s["time"] - running["started"]
+                    out.append((f"  {lane:<6} {'RUNNING':<8} "
+                                f"{running.get('project', '?'):<22} "
+                                f"{running.get('op', '?'):<7} "
+                                f"{human_time(elapsed):>8}  "
+                                f"{running.get('job', '')}", "run"))
+                    line = self.logs.get(running.get("job"))
+                    if line:
+                        out.append((f"         {line[:width - 10]}", "dim"))
+                elif info.get("enabled") is False:
+                    out.append((f"  {lane:<6} {'off':<8} "
+                                f"{info.get('reason', '')}", "dim"))
+                else:
+                    out.append((f"  {lane:<6} {'idle':<8}", "dim"))
+                if info.get("queued"):
+                    out.append((f"  {'':<6} queued {info['queued']}", "dim"))
+
+            projects = s.get("projects") or []
+            if projects:
+                out.append((f"  projects: {', '.join(projects)}"[:width], "dim"))
+
+        if self.recent:
+            out.append(("", "dim"))
+            out.append(("recent", "head"))
+            for when, project, reply in self.recent:
+                rc = reply.get("rc")
+                mark = "ok " if rc == 0 else ("ERR" if rc else "   ")
+                extra = []
+                if reply.get("seconds") is not None:
+                    extra.append(human_time(reply["seconds"]))
+                if reply.get("peak_mb"):
+                    extra.append(f"peak {reply['peak_mb']}M")
+                if reply.get("error"):
+                    extra.append(str(reply["error"])[:40])
+                out.append((f"  {when} {mark} {project:<22} "
+                            f"{str(reply.get('op', '')):<7} "
+                            f"rc={rc if rc is not None else '-':<4} "
+                            f"{' '.join(extra)}"[:width],
+                            "good" if rc == 0 else "bad" if rc else "dim"))
+        return out
+
+
+def subscribe(client, base):
+    client.subscribe(f"{base}/worker/+/state", qos=0)
+    client.subscribe(f"{base}/worker/+/status", qos=0)
+    client.subscribe(f"{base}/project/+/reply/+", qos=0)
+    client.subscribe(f"{base}/project/+/job/+/log", qos=0)
+
+
+def run_curses(screen, model, args):
+    curses.curs_set(0)
+    screen.nodelay(True)
+    colours = {}
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        for i, (name, fg) in enumerate((("good", curses.COLOR_GREEN),
+                                        ("bad", curses.COLOR_RED),
+                                        ("run", curses.COLOR_CYAN),
+                                        ("head", curses.COLOR_YELLOW)), 1):
+            curses.init_pair(i, fg, -1)
+            colours[name] = curses.color_pair(i)
+    colours["dim"] = curses.A_DIM
+
+    while True:
+        height, width = screen.getmaxyx()
+        screen.erase()
+        title = f" vivadocontainment  {args.broker}:{args.port}  {args.topic}/ "
+        screen.addnstr(0, 0, title.ljust(width - 1), width - 1, curses.A_REVERSE)
+        for row, (text, level) in enumerate(model.frame(width - 1), start=2):
+            if row >= height - 1:
+                break
+            screen.addnstr(row, 0, text, width - 1, colours.get(level, 0))
+        screen.addnstr(height - 1, 0, " q to quit ".ljust(width - 1),
+                       width - 1, curses.A_REVERSE)
+        screen.refresh()
+        if screen.getch() in (ord("q"), ord("Q"), 27):
+            return
+        time.sleep(0.5)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--broker", default="localhost")
+    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--topic", default="vivado")
+    p.add_argument("--user")
+    p.add_argument("--password")
+    p.add_argument("--once", action="store_true",
+                   help="print one frame as plain text and exit")
+    p.add_argument("--settle", type=float, default=2.0,
+                   help="seconds to collect retained messages before drawing")
+    args = p.parse_args()
+
+    model = Model()
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                             client_id=f"vc-top-{int(time.time())}")
+    except AttributeError:
+        client = mqtt.Client(client_id=f"vc-top-{int(time.time())}")
+    if args.user:
+        client.username_pw_set(args.user, args.password)
+    client.on_connect = lambda c, u, f, rc, properties=None: subscribe(
+        c, args.topic.rstrip("/"))
+    client.on_message = lambda c, u, msg: model.on_message(msg.topic, msg.payload)
+    client.connect(args.broker, args.port, keepalive=30)
+    client.loop_start()
+    time.sleep(args.settle)
+
+    try:
+        if args.once:
+            for text, _ in model.frame(100):
+                print(text)
+        else:
+            curses.wrapper(run_curses, model, args)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.loop_stop()
+        client.disconnect()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

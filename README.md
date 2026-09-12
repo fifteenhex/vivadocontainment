@@ -172,7 +172,17 @@ contained, and what is not" in `SPEC.md` for where that stops.
 It takes `VC_BROKER`, `VC_PROJECT` and friends from the environment too, so
 `scripts/vc -p demo status` works standalone.
 
-To watch the traffic rather than take part in it:
+To see what a worker is doing:
+
+    make top                      # live view: lanes, queue, recent jobs
+    make top ARGS=--once          # one frame as text, for a bug report
+
+It shows each worker's health line (boot, how stale its status is, free
+space, whether the toolchain links), what is running in each lane with the
+last log line from the build, what is queued, and what recently finished with
+`rc` and peak memory. It only subscribes, so it cannot disturb the agents.
+
+To watch the raw traffic instead:
 
     make watch                    # everything on the base topic
     make watch PROJECT=demo       # one project
@@ -253,6 +263,7 @@ of GB takes hours -- force it with `make -B vivado` or by deleting the image.
     SPEC.md                   the MQTT protocol, for the agents using it
     scripts/license-mac       pull the node-lock MAC out of a .lic
     scripts/vc                reference MQTT client
+    scripts/vc-top            live view of a worker
     guest/                    files copied verbatim into the image
       etc/initramfs-tools/scripts/vivado   the squashfs+overlay mountroot()
       etc/vivadocontainment/mqtt.conf      generated from config.mk

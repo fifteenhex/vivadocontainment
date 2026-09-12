@@ -223,8 +223,8 @@ QEMU_ARGS = \
 
 # ----------------------------------------------------------------- rules ---
 
-.PHONY: all rootfs vivado run run-bg stop ssh vc watch license-mac sizes deps \
-        scratch swap check clean clean-all info
+.PHONY: all rootfs vivado run run-bg stop ssh vc watch top license-mac sizes \
+        deps scratch swap check clean clean-all info
 
 all: rootfs vivado
 
@@ -403,6 +403,15 @@ ssh:
 vc:
 	@test -n "$(ARGS)" || { echo 'usage: make vc ARGS="-p PROJECT op ..."'; exit 1; }
 	scripts/vc --broker $(if $(MQTT_BROKER),$(MQTT_BROKER),localhost) \
+		--port $(MQTT_PORT) --topic $(MQTT_TOPIC) \
+		$(if $(MQTT_USER),--user $(MQTT_USER) --password $(MQTT_PASS)) $(ARGS)
+
+# A live view of the worker: what is running, what is queued, what just
+# finished. Listens only, so it cannot disturb the agents using it.
+#   make top            -- the TUI
+#   make top ARGS=--once -- one frame as text, for pasting into a report
+top:
+	scripts/vc-top --broker $(if $(MQTT_BROKER),$(MQTT_BROKER),localhost) \
 		--port $(MQTT_PORT) --topic $(MQTT_TOPIC) \
 		$(if $(MQTT_USER),--user $(MQTT_USER) --password $(MQTT_PASS)) $(ARGS)
 
